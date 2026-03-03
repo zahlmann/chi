@@ -13,19 +13,22 @@ It is intentionally small and uses only `chi.h` + `chi.c` for the SDK.
 
 ```bash
 cd /home/johann/code/chi
-make
+cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L \
+  -I. chi.c examples/demo.c -o chi_demo
 ```
 
 ## Run Demo
 
 ```bash
-./bin/chi_demo
+./chi_demo
 ```
 
 ## Run Tests
 
 ```bash
-make test
+cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L \
+  -I. chi.c tests/test_chi.c -o test_chi
+./test_chi
 ```
 
 ## API Shape
