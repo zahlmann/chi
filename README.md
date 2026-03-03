@@ -25,11 +25,16 @@ OPENAI_API_KEY=$OPENAI_API_KEY ./chi \
 ```
 
 `chi` uses `OPENAI_API_KEY` from your shell env and requires `curl`.
+It forces `curl` retries off (`--retry 0`) and ignores user/global curl configs (`-q`)
+so provider failures fail fast instead of looping.
 
 ## Backends And Auth
 
 - `openai` backend (default): set `OPENAI_API_KEY`
 - `chatgpt` backend: set `CHATGPT_ACCESS_TOKEN` or `CHATGPT_SESSION_TOKEN`
+- optional network tuning:
+  - `CHI_HTTP_CONNECT_TIMEOUT` (default `5`)
+  - `CHI_HTTP_MAX_TIME` (default `45`)
 
 Example:
 

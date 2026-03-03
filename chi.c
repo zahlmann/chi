@@ -18,6 +18,8 @@
 #define CHI_MAX_OUTPUT_LINES 300
 #define CHI_MAX_OUTPUT_BYTES (24 * 1024)
 #define CHI_SESSION_ID_MAX 64
+#define CHI_HTTP_CONNECT_TIMEOUT_DEFAULT 5
+#define CHI_HTTP_MAX_TIME_DEFAULT 45
 
 typedef enum {
   CHI_BACKEND_OPENAI = 0,
@@ -196,6 +198,39 @@ static long long chi_now_ms(void) {
     return 0;
   }
   return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L);
+}
+
+static int chi_env_positive_int(const char *name, int fallback) {
+  const char *raw;
+  char *end = NULL;
+  long value;
+
+  if (name == NULL || fallback <= 0) {
+    return fallback;
+  }
+
+  raw = getenv(name);
+  if (chi_is_blank(raw)) {
+    return fallback;
+  }
+
+  errno = 0;
+  value = strtol(raw, &end, 10);
+  if (errno != 0 || end == raw) {
+    return fallback;
+  }
+
+  while (*end != '\0') {
+    if (!isspace((unsigned char)*end)) {
+      return fallback;
+    }
+    end++;
+  }
+
+  if (value <= 0 || value > 86400) {
+    return fallback;
+  }
+  return (int)value;
 }
 
 static void chi_random_hex(char *out, size_t out_size, size_t bytes_needed) {
@@ -744,6 +779,58 @@ static char *chi_shell_quote(const char *text) {
   return out;
 }
 
+static int chi_cmd_append_checked(
+    char **cmd,
+    size_t *cmd_len,
+    size_t *cmd_cap,
+    const char *text,
+    const char **fail_msg) {
+  if (!chi_append(cmd, cmd_len, cmd_cap, text)) {
+    *fail_msg = "out of memory building curl command";
+    return 0;
+  }
+  return 1;
+}
+
+static int chi_cmd_append_quoted(
+    char **cmd,
+    size_t *cmd_len,
+    size_t *cmd_cap,
+    const char *prefix,
+    const char *raw_value,
+    const char **fail_msg) {
+  char *quoted;
+  int ok;
+
+  quoted = chi_shell_quote(raw_value);
+  if (quoted == NULL) {
+    *fail_msg = "out of memory building curl command";
+    return 0;
+  }
+
+  ok = 1;
+  if (prefix != NULL && !chi_cmd_append_checked(cmd, cmd_len, cmd_cap, prefix, fail_msg)) {
+    ok = 0;
+  }
+  if (ok && !chi_cmd_append_checked(cmd, cmd_len, cmd_cap, quoted, fail_msg)) {
+    ok = 0;
+  }
+
+  free(quoted);
+  return ok;
+}
+
+static int chi_prepare_temp_file(char path_template[], int *fd, int *created) {
+  *fd = mkstemp(path_template);
+  if (*fd < 0) {
+    return 0;
+  }
+  *created = 1;
+  close(*fd);
+  *fd = -1;
+  return 1;
+}
+
 static int chi_curl_request(
     const char *method,
     const char *url,
@@ -755,36 +842,42 @@ static int chi_curl_request(
     char **err_out) {
   char req_path[] = "/tmp/chi-req-XXXXXX";
   char resp_path[] = "/tmp/chi-resp-XXXXXX";
+  char err_path[] = "/tmp/chi-err-XXXXXX";
   int req_fd = -1;
   int resp_fd = -1;
+  int err_fd = -1;
   char *cmd = NULL;
   size_t cmd_len = 0;
   size_t cmd_cap = 0;
-  char *url_q = NULL;
-  char *req_q = NULL;
-  char *resp_q = NULL;
   FILE *pipe = NULL;
   char status_buf[64];
+  char curl_flags[128];
   int status = 0;
   size_t i;
   int ok = 0;
   int req_created = 0;
   int resp_created = 0;
+  int err_created = 0;
+  int connect_timeout = 0;
+  int max_time = 0;
   const char *fail_msg = NULL;
+  char *fail_detail = NULL;
 
   *response_body = NULL;
   *http_code = 0;
   *err_out = NULL;
 
+  connect_timeout = chi_env_positive_int("CHI_HTTP_CONNECT_TIMEOUT", CHI_HTTP_CONNECT_TIMEOUT_DEFAULT);
+  max_time = chi_env_positive_int("CHI_HTTP_MAX_TIME", CHI_HTTP_MAX_TIME_DEFAULT);
+  if (max_time < connect_timeout) {
+    max_time = connect_timeout;
+  }
+
   if (request_body != NULL) {
-    req_fd = mkstemp(req_path);
-    if (req_fd < 0) {
+    if (!chi_prepare_temp_file(req_path, &req_fd, &req_created)) {
       fail_msg = "failed to create request temp file";
       goto cleanup;
     }
-    req_created = 1;
-    close(req_fd);
-    req_fd = -1;
 
     if (!chi_write_file(req_path, request_body)) {
       fail_msg = "failed to write request body";
@@ -792,62 +885,53 @@ static int chi_curl_request(
     }
   }
 
-  resp_fd = mkstemp(resp_path);
-  if (resp_fd < 0) {
+  if (!chi_prepare_temp_file(resp_path, &resp_fd, &resp_created)) {
     fail_msg = "failed to create response temp file";
     goto cleanup;
   }
-  resp_created = 1;
-  close(resp_fd);
-  resp_fd = -1;
 
-  url_q = chi_shell_quote(url);
-  resp_q = chi_shell_quote(resp_path);
-  if (request_body != NULL) {
-    req_q = chi_shell_quote(req_path);
-  }
-  if (url_q == NULL || resp_q == NULL || (request_body != NULL && req_q == NULL)) {
-    fail_msg = "out of memory building curl command";
+  if (!chi_prepare_temp_file(err_path, &err_fd, &err_created)) {
+    fail_msg = "failed to create curl stderr temp file";
     goto cleanup;
   }
 
-  if (!chi_append(&cmd, &cmd_len, &cmd_cap, "curl -sS -o ") ||
-      !chi_append(&cmd, &cmd_len, &cmd_cap, resp_q) ||
-      !chi_append(&cmd, &cmd_len, &cmd_cap, " -w '%{http_code}'")) {
-    fail_msg = "out of memory building curl command";
+  snprintf(
+      curl_flags,
+      sizeof(curl_flags),
+      "curl -q -sS --retry 0 --connect-timeout %d --max-time %d -o ",
+      connect_timeout,
+      max_time);
+  if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, curl_flags, &fail_msg) ||
+      !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, resp_path, &fail_msg) ||
+      !chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " -w '%{http_code}'", &fail_msg)) {
     goto cleanup;
   }
 
   if (method != NULL && strcmp(method, "POST") == 0) {
-    if (!chi_append(&cmd, &cmd_len, &cmd_cap, " -X POST")) {
-      fail_msg = "out of memory building curl command";
+    if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " -X POST", &fail_msg)) {
       goto cleanup;
     }
   }
 
   for (i = 0; i < header_count; i++) {
-    char *hq = chi_shell_quote(headers[i]);
-    if (hq == NULL ||
-        !chi_append(&cmd, &cmd_len, &cmd_cap, " -H ") ||
-        !chi_append(&cmd, &cmd_len, &cmd_cap, hq)) {
-      free(hq);
-      fail_msg = "out of memory building curl command";
+    if (!chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, " -H ", headers[i], &fail_msg)) {
       goto cleanup;
     }
-    free(hq);
   }
 
   if (request_body != NULL) {
-    if (!chi_append(&cmd, &cmd_len, &cmd_cap, " --data-binary @") ||
-        !chi_append(&cmd, &cmd_len, &cmd_cap, req_q)) {
-      fail_msg = "out of memory building curl command";
+    if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " --data-binary @", &fail_msg) ||
+        !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, req_path, &fail_msg)) {
       goto cleanup;
     }
   }
 
-  if (!chi_append(&cmd, &cmd_len, &cmd_cap, " ") ||
-      !chi_append(&cmd, &cmd_len, &cmd_cap, url_q)) {
-    fail_msg = "out of memory building curl command";
+  if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " ", &fail_msg) ||
+      !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, url, &fail_msg)) {
+    goto cleanup;
+  }
+  if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " 2>", &fail_msg) ||
+      !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, err_path, &fail_msg)) {
     goto cleanup;
   }
 
@@ -872,7 +956,17 @@ static int chi_curl_request(
   }
 
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    fail_msg = "curl request failed";
+    char *curl_stderr = chi_read_file(err_path);
+    int exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (WIFSIGNALED(status)) {
+      fail_detail = chi_format("curl request terminated by signal %d", WTERMSIG(status));
+    } else if (!chi_is_blank(curl_stderr)) {
+      fail_detail = chi_format("curl request failed (exit %d): %s", exit_status, curl_stderr);
+    } else if (exit_status >= 0) {
+      fail_detail = chi_format("curl request failed (exit %d)", exit_status);
+    }
+    free(curl_stderr);
+    fail_msg = fail_detail != NULL ? fail_detail : "curl request failed";
     free(*response_body);
     *response_body = NULL;
     goto cleanup;
@@ -888,12 +982,12 @@ cleanup:
   if (resp_fd >= 0) {
     close(resp_fd);
   }
+  if (err_fd >= 0) {
+    close(err_fd);
+  }
   if (pipe != NULL) {
     pclose(pipe);
   }
-  free(url_q);
-  free(resp_q);
-  free(req_q);
   free(cmd);
   if (resp_created) {
     unlink(resp_path);
@@ -901,9 +995,13 @@ cleanup:
   if (req_created) {
     unlink(req_path);
   }
+  if (err_created) {
+    unlink(err_path);
+  }
   if (!ok && fail_msg != NULL) {
     *err_out = chi_strdup(fail_msg);
   }
+  free(fail_detail);
   return ok;
 }
 
@@ -1424,7 +1522,6 @@ static int chi_provider_request_with_auth(
     const char *auth_token,
     const char *url_env,
     const char *default_url,
-    const char *request_failed_msg,
     const char *http_label,
     int chatgpt_mode,
     chi_action *action,
@@ -1469,7 +1566,10 @@ static int chi_provider_request_with_auth(
   }
 
   if (!chi_curl_request("POST", url, headers, 2, req_json, &resp_json, &http_code, &tmp_err)) {
-    *err_out = tmp_err != NULL ? tmp_err : chi_strdup(request_failed_msg);
+    *err_out = tmp_err;
+    if (*err_out == NULL) {
+      *err_out = chi_strdup("provider request failed");
+    }
     free(req_json);
     free(auth);
     return 0;
@@ -1510,7 +1610,6 @@ static int chi_provider_openai(
       api_key,
       "OPENAI_API_URL",
       "https://api.openai.com/v1/responses",
-      "openai request failed",
       "openai",
       0,
       action,
@@ -1566,7 +1665,7 @@ static int chi_resolve_chatgpt_access_token(chi_config *cfg, char **token_out, c
           &auth_resp,
           &http_code,
           &tmp_err)) {
-    *err_out = tmp_err != NULL ? tmp_err : chi_strdup("chatgpt auth session request failed");
+    *err_out = tmp_err;
     free(cookie);
     return 0;
   }
@@ -1619,7 +1718,6 @@ static int chi_provider_chatgpt(
       token,
       "CHATGPT_API_URL",
       "https://chatgpt.com/backend-api/codex/responses",
-      "chatgpt request failed",
       "chatgpt",
       1,
       action,
@@ -1727,6 +1825,8 @@ static void chi_usage(const char *argv0) {
           "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend\n"
           "  CHATGPT_SESSION_TOKEN        alternate auth for chatgpt backend\n"
           "  CHI_BACKEND                  default backend (openai|chatgpt)\n"
+          "  CHI_HTTP_CONNECT_TIMEOUT     curl connect timeout seconds (default: 5)\n"
+          "  CHI_HTTP_MAX_TIME            curl total timeout seconds (default: 45)\n"
           "  CHI_DEBUG                    set to non-zero for debug logs\n",
           argv0,
           argv0);
