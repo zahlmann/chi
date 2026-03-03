@@ -14,9 +14,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CHI_MAX_TURNS 48
-#define CHI_MAX_OUTPUT_LINES 2000
-#define CHI_MAX_OUTPUT_BYTES (50 * 1024)
+#define CHI_MAX_TURNS 256
+#define CHI_MAX_OUTPUT_LINES 300
+#define CHI_MAX_OUTPUT_BYTES (24 * 1024)
 #define CHI_SESSION_ID_MAX 64
 
 typedef enum {
