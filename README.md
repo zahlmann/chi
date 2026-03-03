@@ -1,6 +1,6 @@
 # chi
 
-`chi` is a compact, dependency-free C reimplementation of `phi`'s core logic:
+`chi` is a compact, dependency-free C coding-agent runtime:
 
 - session runtime with queued user messages
 - tool-call loop (`assistant -> tool -> assistant`)
@@ -30,6 +30,19 @@ cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L \
   -I. chi.c tests/test_chi.c -o test_chi
 ./test_chi
 ```
+
+## Run Live Agent (OPENAI_API_KEY)
+
+```bash
+cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L \
+  -I. chi.c agent.c -o chi_agent
+
+OPENAI_API_KEY="$OPENAI_API_KEY" ./chi_agent \
+  "Use bash to create hello.py and run it with uv run hello.py" \
+  /home/johann/code/chi/agent_playground
+```
+
+`chi_agent` needs `curl` installed and reads `OPENAI_API_KEY` from your shell environment.
 
 ## API Shape
 

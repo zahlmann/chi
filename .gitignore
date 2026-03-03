@@ -2,3 +2,5 @@
 *.o
 chi_demo
 test_chi
+chi_agent
+agent_playground/
