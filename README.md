@@ -1,10 +1,10 @@
 # chi
 
-`chi` is a compact, dependency-free C coding-agent runtime:
+`chi` is a compact, dependency-free C coding-agent CLI runtime:
 
-- session runtime with queued user messages
-- tool-call loop (`assistant -> tool -> assistant`)
-- event stream callbacks (`tool_call_started`, `tool_call_finished`, `final_message`)
+- queued user messages
+- tool-call loop (`assistant -> bash -> assistant`)
+- switchable backends (`openai`, `chatgpt`)
 - built-in `bash` tool
 
 It is intentionally small.
@@ -25,3 +25,14 @@ OPENAI_API_KEY=$OPENAI_API_KEY ./chi \
 ```
 
 `chi` uses `OPENAI_API_KEY` from your shell env and requires `curl`.
+
+## Backends And Auth
+
+- `openai` backend (default): set `OPENAI_API_KEY`
+- `chatgpt` backend: set `CHATGPT_ACCESS_TOKEN` or `CHATGPT_SESSION_TOKEN`
+
+Example:
+
+```bash
+CHI_BACKEND=chatgpt CHATGPT_ACCESS_TOKEN=$CHATGPT_ACCESS_TOKEN ./chi "List files" .
+```
