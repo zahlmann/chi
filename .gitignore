@@ -1,6 +1,3 @@
-/bin/
 *.o
-chi_demo
-test_chi
-chi_agent
+chi
 agent_playground/

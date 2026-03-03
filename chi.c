@@ -1,4 +1,159 @@
-#include "chi.h"
+#include <stddef.h>
+
+typedef enum {
+  CHI_OK = 0,
+  CHI_ERR_INVALID_ARGUMENT,
+  CHI_ERR_NOT_FOUND,
+  CHI_ERR_QUEUE_FULL,
+  CHI_ERR_PROVIDER_FAILED,
+  CHI_ERR_TOOL_FAILED,
+  CHI_ERR_OOM,
+  CHI_ERR_INTERNAL
+} chi_status;
+
+typedef enum {
+  CHI_STOP_STOP = 0,
+  CHI_STOP_LENGTH,
+  CHI_STOP_TOOL_USE,
+  CHI_STOP_ERROR
+} chi_stop_reason;
+
+#define CHI_SESSION_ID_MAX 64
+
+typedef struct {
+  const char *id;
+  const char *name;
+  const char *arguments_json;
+} chi_tool_call;
+
+typedef struct chi_message {
+  const char *role;
+  const char *text;
+  const char *tool_call_id;
+  const char *tool_name;
+  const char *arguments_json;
+  const char *details_json;
+  chi_stop_reason stop_reason;
+  const chi_tool_call *tool_calls;
+  size_t tool_call_count;
+  long long timestamp_ms;
+} chi_message;
+
+typedef struct chi_provider_response {
+  const char *text;
+  chi_stop_reason stop_reason;
+  const chi_tool_call *tool_calls;
+  size_t tool_call_count;
+  const char *error_message;
+} chi_provider_response;
+
+struct chi_tool_def;
+
+typedef struct {
+  const char *session_id;
+  const char *system_prompt;
+  const char *model_id;
+  const char *reasoning_effort;
+  const chi_message *messages;
+  size_t message_count;
+  const struct chi_tool_def *tools;
+  size_t tool_count;
+} chi_provider_request;
+
+typedef struct {
+  const char *session_id;
+  const char *tool_call_id;
+  const char *tool_name;
+  const char *arguments_json;
+} chi_tool_request;
+
+typedef struct {
+  const char *text;
+  const char *details_json;
+  const char *error;
+} chi_tool_response;
+
+typedef chi_status (*chi_provider_fn)(
+    const chi_provider_request *request,
+    chi_provider_response *response,
+    void *user_data);
+
+typedef chi_status (*chi_tool_execute_fn)(
+    const chi_tool_request *request,
+    chi_tool_response *response,
+    void *user_data);
+
+typedef void (*chi_tool_destroy_fn)(void *user_data);
+
+typedef struct chi_tool_def {
+  const char *name;
+  const char *description;
+  chi_tool_execute_fn execute;
+  void *user_data;
+  chi_tool_destroy_fn destroy_user_data;
+} chi_tool_def;
+
+typedef enum {
+  CHI_EVENT_TOOL_CALL_STARTED = 0,
+  CHI_EVENT_TOOL_CALL_FINISHED,
+  CHI_EVENT_FINAL_MESSAGE
+} chi_event_type;
+
+typedef struct {
+  chi_event_type type;
+  const char *session_id;
+  const char *tool_name;
+  const char *tool_call_id;
+  int is_error;
+  const chi_message *tool_result;
+  const chi_message *assistant_message;
+  const char *error;
+} chi_event;
+
+typedef void (*chi_event_handler)(const chi_event *event, void *user_data);
+
+typedef struct {
+  chi_provider_fn provider;
+  void *provider_user_data;
+  const char *model_id;
+  const char *system_prompt;
+  const char *reasoning_effort;
+  const char *working_dir;
+  size_t queue_capacity;
+  int include_bash_tool;
+  double bash_timeout_seconds;
+} chi_runtime_options;
+
+typedef struct chi_runtime chi_runtime;
+
+const char *chi_status_string(chi_status status);
+chi_runtime_options chi_runtime_options_default(void);
+chi_runtime *chi_runtime_create(const chi_runtime_options *options);
+void chi_runtime_destroy(chi_runtime *runtime);
+chi_status chi_runtime_add_tool(chi_runtime *runtime, chi_tool_def tool);
+chi_status chi_runtime_subscribe(
+    chi_runtime *runtime,
+    chi_event_handler handler,
+    void *user_data,
+    size_t *subscription_id_out);
+chi_status chi_runtime_unsubscribe(chi_runtime *runtime, size_t subscription_id);
+chi_status chi_runtime_start_session(
+    chi_runtime *runtime,
+    const char *prompt,
+    char *session_id_out,
+    size_t session_id_out_size);
+chi_status chi_runtime_queue_message(
+    chi_runtime *runtime,
+    const char *session_id,
+    const char *prompt);
+size_t chi_runtime_session_message_count(
+    const chi_runtime *runtime,
+    const char *session_id);
+const chi_message *chi_runtime_session_message_at(
+    const chi_runtime *runtime,
+    const char *session_id,
+    size_t index);
+chi_tool_def chi_make_bash_tool(const char *working_dir, double default_timeout_seconds);
 
 #include <ctype.h>
 #include <errno.h>
@@ -15,7 +170,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CHI_DEFAULT_MAX_TOOL_ROUNDS 24
 #define CHI_DEFAULT_QUEUE_CAPACITY 256
 #define CHI_BASH_MAX_LINES 2000
 #define CHI_BASH_MAX_BYTES (50 * 1024)
@@ -45,7 +199,6 @@ struct chi_runtime {
   char *system_prompt;
   char *reasoning_effort;
   size_t queue_capacity;
-  int max_tool_rounds;
 
   chi_tool_def *tools;
   size_t tool_count;
@@ -1320,7 +1473,6 @@ static chi_status run_turn(
     chi_session *session,
     chi_message **assistant_out,
     char **error_out) {
-  int round;
   chi_message *last_assistant = NULL;
 
   if (assistant_out != NULL) {
@@ -1337,7 +1489,7 @@ static chi_status run_turn(
     return CHI_OK;
   }
 
-  for (round = 0; round < runtime->max_tool_rounds; round++) {
+  for (;;) {
     chi_provider_request request;
     chi_provider_response response;
     chi_status provider_status;
@@ -1434,19 +1586,6 @@ static chi_status run_turn(
       }
     }
   }
-
-  if (error_out != NULL) {
-    if (last_assistant != NULL) {
-      *error_out = chi_strdup_local("max tool rounds reached without final assistant response");
-    } else {
-      *error_out = chi_strdup_local("max tool rounds reached without assistant response");
-    }
-  }
-
-  if (assistant_out != NULL) {
-    *assistant_out = last_assistant;
-  }
-  return CHI_ERR_MAX_TOOL_ROUNDS;
 }
 
 static void drain_session(chi_runtime *runtime, chi_session *session) {
@@ -1560,8 +1699,6 @@ const char *chi_status_string(chi_status status) {
       return "provider failed";
     case CHI_ERR_TOOL_FAILED:
       return "tool failed";
-    case CHI_ERR_MAX_TOOL_ROUNDS:
-      return "max tool rounds reached";
     case CHI_ERR_OOM:
       return "out of memory";
     case CHI_ERR_INTERNAL:
@@ -1576,7 +1713,6 @@ chi_runtime_options chi_runtime_options_default(void) {
   memset(&options, 0, sizeof(options));
   options.model_id = "gpt-5.2-codex";
   options.reasoning_effort = "xhigh";
-  options.max_tool_rounds = CHI_DEFAULT_MAX_TOOL_ROUNDS;
   options.queue_capacity = CHI_DEFAULT_QUEUE_CAPACITY;
   options.include_bash_tool = 1;
   options.bash_timeout_seconds = 0.0;
@@ -1600,7 +1736,6 @@ chi_runtime *chi_runtime_create(const chi_runtime_options *options) {
 
   runtime->provider = cfg->provider;
   runtime->provider_user_data = cfg->provider_user_data;
-  runtime->max_tool_rounds = cfg->max_tool_rounds > 0 ? cfg->max_tool_rounds : CHI_DEFAULT_MAX_TOOL_ROUNDS;
   runtime->queue_capacity = cfg->queue_capacity > 0 ? cfg->queue_capacity : CHI_DEFAULT_QUEUE_CAPACITY;
   runtime->next_subscription_id = 1;
 
@@ -1830,4 +1965,692 @@ const chi_message *chi_runtime_session_message_at(
     return NULL;
   }
   return &session->messages[index];
+}
+
+typedef struct {
+  char *response_json;
+  char *output_text;
+  char *action_json;
+  char *tool_args_json;
+  char *tool_call_id;
+  char *final_text;
+  char *error_text;
+  chi_tool_call tool_call;
+  unsigned long long call_seq;
+} chi_openai_state;
+
+static int chi_cli_debug_enabled(void) {
+  const char *v = getenv("CHI_DEBUG");
+  return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static void chi_openai_state_reset(chi_openai_state *state) {
+  if (state == NULL) {
+    return;
+  }
+  free((char *)state->tool_call.name);
+  free(state->response_json);
+  free(state->output_text);
+  free(state->action_json);
+  free(state->tool_args_json);
+  free(state->tool_call_id);
+  free(state->final_text);
+  free(state->error_text);
+  memset(state, 0, sizeof(*state));
+}
+
+static int chi_cli_append(char **buf, size_t *len, size_t *cap, const char *text) {
+  size_t n;
+  size_t needed;
+  char *grown;
+
+  if (text == NULL) {
+    text = "";
+  }
+  n = strlen(text);
+  needed = *len + n + 1;
+  if (needed > *cap) {
+    size_t new_cap = (*cap == 0) ? 512 : *cap;
+    while (new_cap < needed) {
+      if (new_cap > (size_t)-1 / 2) {
+        return 0;
+      }
+      new_cap *= 2;
+    }
+    grown = (char *)realloc(*buf, new_cap);
+    if (grown == NULL) {
+      return 0;
+    }
+    *buf = grown;
+    *cap = new_cap;
+  }
+  memcpy(*buf + *len, text, n);
+  *len += n;
+  (*buf)[*len] = '\0';
+  return 1;
+}
+
+static char *chi_cli_parse_json_string(const char *p) {
+  char *out = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  if (p == NULL || *p != '"') {
+    return NULL;
+  }
+  p++;
+
+  while (*p != '\0' && *p != '"') {
+    char c = *p;
+    if (c == '\\') {
+      p++;
+      if (*p == '\0') {
+        break;
+      }
+      switch (*p) {
+        case 'n':
+          c = '\n';
+          break;
+        case 'r':
+          c = '\r';
+          break;
+        case 't':
+          c = '\t';
+          break;
+        case '"':
+          c = '"';
+          break;
+        case '\\':
+          c = '\\';
+          break;
+        default:
+          c = *p;
+          break;
+      }
+    }
+
+    {
+      char one[2];
+      one[0] = c;
+      one[1] = '\0';
+      if (!chi_cli_append(&out, &len, &cap, one)) {
+        free(out);
+        return NULL;
+      }
+    }
+
+    p++;
+  }
+
+  if (out == NULL) {
+    out = chi_strdup_local("");
+  }
+  return out;
+}
+
+static int chi_cli_write_file(const char *path, const char *content) {
+  FILE *f;
+  size_t n;
+
+  f = fopen(path, "wb");
+  if (f == NULL) {
+    return 0;
+  }
+  n = strlen(content);
+  if (n > 0 && fwrite(content, 1, n, f) != n) {
+    fclose(f);
+    return 0;
+  }
+  fclose(f);
+  return 1;
+}
+
+static char *chi_cli_read_file(const char *path) {
+  FILE *f;
+  char *buf;
+  long size;
+  size_t got;
+
+  f = fopen(path, "rb");
+  if (f == NULL) {
+    return NULL;
+  }
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return NULL;
+  }
+  size = ftell(f);
+  if (size < 0) {
+    fclose(f);
+    return NULL;
+  }
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    fclose(f);
+    return NULL;
+  }
+
+  buf = (char *)malloc((size_t)size + 1);
+  if (buf == NULL) {
+    fclose(f);
+    return NULL;
+  }
+
+  got = fread(buf, 1, (size_t)size, f);
+  fclose(f);
+  if (got != (size_t)size) {
+    free(buf);
+    return NULL;
+  }
+  buf[size] = '\0';
+  return buf;
+}
+
+static int chi_cli_curl_responses(const char *request_json, char **response_body, int *http_code, char **err_out) {
+  char req_path[] = "/tmp/chi-openai-req-XXXXXX";
+  char resp_path[] = "/tmp/chi-openai-resp-XXXXXX";
+  int req_fd;
+  int resp_fd;
+  FILE *pipe;
+  int status;
+  char status_buf[64];
+  char *cmd;
+
+  *response_body = NULL;
+  *http_code = 0;
+  *err_out = NULL;
+
+  req_fd = mkstemp(req_path);
+  if (req_fd < 0) {
+    *err_out = chi_strdup_local("failed to create request temp file");
+    return 0;
+  }
+  close(req_fd);
+
+  resp_fd = mkstemp(resp_path);
+  if (resp_fd < 0) {
+    unlink(req_path);
+    *err_out = chi_strdup_local("failed to create response temp file");
+    return 0;
+  }
+  close(resp_fd);
+
+  if (!chi_cli_write_file(req_path, request_json)) {
+    unlink(req_path);
+    unlink(resp_path);
+    *err_out = chi_strdup_local("failed to write request body");
+    return 0;
+  }
+
+  cmd = (char *)malloc(strlen(req_path) + strlen(resp_path) + 512);
+  if (cmd == NULL) {
+    unlink(req_path);
+    unlink(resp_path);
+    *err_out = chi_strdup_local("out of memory building curl command");
+    return 0;
+  }
+
+  snprintf(
+      cmd,
+      strlen(req_path) + strlen(resp_path) + 512,
+      "curl -sS -o '%s' -w '%%{http_code}' https://api.openai.com/v1/responses "
+      "-H \"Authorization: Bearer $OPENAI_API_KEY\" "
+      "-H 'Content-Type: application/json' --data-binary '@%s'",
+      resp_path,
+      req_path);
+
+  pipe = popen(cmd, "r");
+  if (pipe == NULL) {
+    free(cmd);
+    unlink(req_path);
+    unlink(resp_path);
+    *err_out = chi_strdup_local("failed to run curl");
+    return 0;
+  }
+
+  memset(status_buf, 0, sizeof(status_buf));
+  if (fgets(status_buf, sizeof(status_buf), pipe) == NULL) {
+    status_buf[0] = '\0';
+  }
+
+  status = pclose(pipe);
+  free(cmd);
+
+  *response_body = chi_cli_read_file(resp_path);
+  unlink(req_path);
+  unlink(resp_path);
+
+  if (*response_body == NULL) {
+    *err_out = chi_strdup_local("failed to read curl response body");
+    return 0;
+  }
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    *err_out = chi_strdup_local("curl request failed");
+    free(*response_body);
+    *response_body = NULL;
+    return 0;
+  }
+
+  *http_code = atoi(status_buf);
+  return 1;
+}
+
+static char *chi_cli_extract_output_text(const char *json) {
+  const char *p;
+  const char *next_text;
+  const char *v;
+  char *text;
+
+  text = json_extract_string(json, "output_text");
+  if (text != NULL && text[0] != '\0') {
+    return text;
+  }
+  free(text);
+
+  p = json;
+  while (p != NULL) {
+    p = strstr(p, "\"output_text\"");
+    if (p == NULL) {
+      break;
+    }
+    next_text = strstr(p, "\"text\"");
+    if (next_text != NULL) {
+      v = strchr(next_text, ':');
+      if (v != NULL) {
+        v = skip_ws(v + 1);
+        if (v != NULL && *v == '"') {
+          char *parsed = chi_cli_parse_json_string(v);
+          if (parsed != NULL && parsed[0] != '\0') {
+            return parsed;
+          }
+          free(parsed);
+        }
+      }
+    }
+    p += 12;
+  }
+
+  return NULL;
+}
+
+static char *chi_cli_extract_json_object(const char *text) {
+  const char *start;
+  const char *end;
+  size_t len;
+  char *out;
+
+  if (text == NULL) {
+    return NULL;
+  }
+
+  start = strchr(text, '{');
+  end = strrchr(text, '}');
+  if (start == NULL || end == NULL || end < start) {
+    return NULL;
+  }
+
+  len = (size_t)(end - start + 1);
+  out = (char *)malloc(len + 1);
+  if (out == NULL) {
+    return NULL;
+  }
+  memcpy(out, start, len);
+  out[len] = '\0';
+  return out;
+}
+
+static char *chi_cli_serialize_conversation(const chi_provider_request *request) {
+  size_t i;
+  char *buf = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  if (!chi_cli_append(&buf, &len, &cap, "Conversation so far:\n")) {
+    free(buf);
+    return NULL;
+  }
+
+  for (i = 0; i < request->message_count; i++) {
+    const chi_message *m = &request->messages[i];
+    const char *role = (m->role == NULL) ? "unknown" : m->role;
+    const char *text = (m->text == NULL) ? "" : m->text;
+
+    if (!chi_cli_append(&buf, &len, &cap, "- ") ||
+        !chi_cli_append(&buf, &len, &cap, role) ||
+        !chi_cli_append(&buf, &len, &cap, ": ") ||
+        !chi_cli_append(&buf, &len, &cap, text) ||
+        !chi_cli_append(&buf, &len, &cap, "\n")) {
+      free(buf);
+      return NULL;
+    }
+
+    if (m->arguments_json != NULL && m->arguments_json[0] != '\0') {
+      if (!chi_cli_append(&buf, &len, &cap, "  args=") ||
+          !chi_cli_append(&buf, &len, &cap, m->arguments_json) ||
+          !chi_cli_append(&buf, &len, &cap, "\n")) {
+        free(buf);
+        return NULL;
+      }
+    }
+  }
+
+  if (!chi_cli_append(&buf, &len, &cap, "\nDecide next step with JSON only.\n")) {
+    free(buf);
+    return NULL;
+  }
+
+  return buf;
+}
+
+static chi_status chi_openai_provider(
+    const chi_provider_request *request,
+    chi_provider_response *response,
+    void *user_data) {
+  chi_openai_state *state = (chi_openai_state *)user_data;
+  const char *model;
+  const char *reasoning;
+  const char *instructions =
+      "You are a coding agent controller with one tool: bash. "
+      "Return only JSON with no markdown.\n"
+      "Schema:\n"
+      "- tool: {\"kind\":\"tool\",\"name\":\"bash\",\"arguments\":{\"command\":\"...\",\"timeout\":number(optional)}}\n"
+      "- final: {\"kind\":\"final\",\"text\":\"...\"}\n"
+      "Rules:\n"
+      "- Use bash to write/run files.\n"
+      "- Use uv run for python.\n"
+      "- Once task is complete, return final.\n";
+  char *conversation = NULL;
+  char *esc_model = NULL;
+  char *esc_reasoning = NULL;
+  char *esc_instructions = NULL;
+  char *esc_conversation = NULL;
+  char *request_json = NULL;
+  char *resp_body = NULL;
+  char *curl_err = NULL;
+  char *kind = NULL;
+  int http_code = 0;
+
+  memset(response, 0, sizeof(*response));
+  chi_openai_state_reset(state);
+
+  if (getenv("OPENAI_API_KEY") == NULL || getenv("OPENAI_API_KEY")[0] == '\0') {
+    state->error_text = chi_strdup_local("OPENAI_API_KEY is not set");
+    return CHI_ERR_PROVIDER_FAILED;
+  }
+
+  model = (request->model_id != NULL && request->model_id[0] != '\0') ? request->model_id : "gpt-5.2-codex";
+  reasoning = (request->reasoning_effort != NULL && request->reasoning_effort[0] != '\0') ? request->reasoning_effort : "high";
+
+  conversation = chi_cli_serialize_conversation(request);
+  esc_model = json_escape(model);
+  esc_reasoning = json_escape(reasoning);
+  esc_instructions = json_escape(instructions);
+  esc_conversation = json_escape(conversation);
+
+  if (conversation == NULL || esc_model == NULL || esc_reasoning == NULL ||
+      esc_instructions == NULL || esc_conversation == NULL) {
+    free(conversation);
+    free(esc_model);
+    free(esc_reasoning);
+    free(esc_instructions);
+    free(esc_conversation);
+    return CHI_ERR_OOM;
+  }
+
+  request_json = (char *)malloc(strlen(esc_model) + strlen(esc_reasoning) + strlen(esc_instructions) +
+                                strlen(esc_conversation) + 512);
+  if (request_json == NULL) {
+    free(conversation);
+    free(esc_model);
+    free(esc_reasoning);
+    free(esc_instructions);
+    free(esc_conversation);
+    return CHI_ERR_OOM;
+  }
+
+  snprintf(request_json,
+           strlen(esc_model) + strlen(esc_reasoning) + strlen(esc_instructions) + strlen(esc_conversation) + 512,
+           "{"
+           "\"model\":\"%s\","
+           "\"input\":["
+           "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]},"
+           "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]}"
+           "],"
+           "\"reasoning\":{\"effort\":\"%s\"},"
+           "\"max_output_tokens\":900"
+           "}",
+           esc_model,
+           esc_instructions,
+           esc_conversation,
+           esc_reasoning);
+
+  free(conversation);
+  free(esc_model);
+  free(esc_reasoning);
+  free(esc_instructions);
+  free(esc_conversation);
+
+  if (!chi_cli_curl_responses(request_json, &resp_body, &http_code, &curl_err)) {
+    state->error_text = curl_err != NULL ? curl_err : chi_strdup_local("curl call failed");
+    if (chi_cli_debug_enabled()) {
+      fprintf(stderr, "[chi debug] curl failed: %s\n", state->error_text == NULL ? "(unknown)" : state->error_text);
+    }
+    free(request_json);
+    return CHI_ERR_PROVIDER_FAILED;
+  }
+  free(request_json);
+
+  state->response_json = resp_body;
+
+  if (http_code < 200 || http_code >= 300) {
+    state->error_text = chi_format("openai http %d: %s", http_code, resp_body);
+    if (chi_cli_debug_enabled()) {
+      fprintf(stderr, "[chi debug] http_code=%d body=%s\n", http_code, resp_body);
+    }
+    return CHI_ERR_PROVIDER_FAILED;
+  }
+
+  state->output_text = chi_cli_extract_output_text(resp_body);
+  if (state->output_text == NULL) {
+    state->error_text = chi_strdup_local("could not parse output text from openai response");
+    if (chi_cli_debug_enabled()) {
+      fprintf(stderr, "[chi debug] parse output_text failed; body=%s\n", resp_body);
+    }
+    return CHI_ERR_PROVIDER_FAILED;
+  }
+
+  state->action_json = chi_cli_extract_json_object(state->output_text);
+  if (state->action_json == NULL) {
+    state->final_text = chi_strdup_local(state->output_text);
+    if (state->final_text == NULL) {
+      return CHI_ERR_OOM;
+    }
+    response->text = state->final_text;
+    response->stop_reason = CHI_STOP_STOP;
+    return CHI_OK;
+  }
+
+  kind = json_extract_string(state->action_json, "kind");
+  if (kind != NULL && strcmp(kind, "tool") == 0) {
+    char *tool_name = json_extract_string(state->action_json, "name");
+    char *command = json_extract_string(state->action_json, "command");
+    char *escaped = NULL;
+    double timeout = 0;
+    int has_timeout = json_extract_number(state->action_json, "timeout", &timeout);
+
+    if (tool_name == NULL || tool_name[0] == '\0') {
+      free(tool_name);
+      tool_name = chi_strdup_local("bash");
+    }
+    if (command == NULL || command[0] == '\0') {
+      free(tool_name);
+      free(command);
+      free(kind);
+      state->final_text = chi_strdup_local("tool call missing command");
+      if (state->final_text == NULL) {
+        return CHI_ERR_OOM;
+      }
+      response->text = state->final_text;
+      response->stop_reason = CHI_STOP_STOP;
+      return CHI_OK;
+    }
+
+    escaped = json_escape(command);
+    if (escaped == NULL) {
+      free(tool_name);
+      free(command);
+      free(kind);
+      return CHI_ERR_OOM;
+    }
+
+    if (has_timeout && timeout > 0) {
+      state->tool_args_json = chi_format("{\"command\":\"%s\",\"timeout\":%.3f}", escaped, timeout);
+    } else {
+      state->tool_args_json = chi_format("{\"command\":\"%s\"}", escaped);
+    }
+    free(escaped);
+
+    if (state->tool_args_json == NULL) {
+      free(tool_name);
+      free(command);
+      free(kind);
+      return CHI_ERR_OOM;
+    }
+
+    state->call_seq++;
+    state->tool_call_id = chi_format("call_%llu", (unsigned long long)state->call_seq);
+    if (state->tool_call_id == NULL) {
+      free(tool_name);
+      free(command);
+      free(kind);
+      return CHI_ERR_OOM;
+    }
+
+    state->tool_call.id = state->tool_call_id;
+    state->tool_call.name = tool_name;
+    state->tool_call.arguments_json = state->tool_args_json;
+
+    response->tool_calls = &state->tool_call;
+    response->tool_call_count = 1;
+    response->stop_reason = CHI_STOP_TOOL_USE;
+
+    free(command);
+    free(kind);
+    return CHI_OK;
+  }
+
+  {
+    char *final_text = json_extract_string(state->action_json, "text");
+    if (final_text == NULL || final_text[0] == '\0') {
+      free(final_text);
+      state->final_text = chi_strdup_local(state->output_text);
+    } else {
+      state->final_text = final_text;
+    }
+  }
+
+  free(kind);
+
+  if (state->final_text == NULL) {
+    return CHI_ERR_OOM;
+  }
+
+  response->text = state->final_text;
+  response->stop_reason = CHI_STOP_STOP;
+  return CHI_OK;
+}
+
+static void chi_cli_on_event(const chi_event *event, void *user_data) {
+  (void)user_data;
+
+  if (event->type == CHI_EVENT_TOOL_CALL_STARTED) {
+    printf("[tool start] %s (%s)\n",
+           event->tool_name == NULL ? "?" : event->tool_name,
+           event->tool_call_id == NULL ? "?" : event->tool_call_id);
+    return;
+  }
+
+  if (event->type == CHI_EVENT_TOOL_CALL_FINISHED) {
+    printf("[tool done] %s (%s) error=%d\n",
+           event->tool_name == NULL ? "?" : event->tool_name,
+           event->tool_call_id == NULL ? "?" : event->tool_call_id,
+           event->is_error);
+    if (event->tool_result != NULL && event->tool_result->text != NULL) {
+      printf("%s\n", event->tool_result->text);
+    }
+    return;
+  }
+
+  if (event->type == CHI_EVENT_FINAL_MESSAGE) {
+    if (event->error != NULL && event->error[0] != '\0') {
+      printf("[final error] %s\n", event->error);
+    }
+    if (event->assistant_message != NULL && event->assistant_message->text != NULL) {
+      printf("[final]\n%s\n", event->assistant_message->text);
+    }
+  }
+}
+
+int main(int argc, char **argv) {
+  chi_runtime_options options;
+  chi_runtime *runtime;
+  chi_openai_state provider;
+  const char *prompt;
+  const char *working_dir;
+  chi_status status;
+  char session_id[CHI_SESSION_ID_MAX];
+
+  if (argc < 2) {
+    fprintf(stderr,
+            "usage: %s \"prompt\" [working_dir]\n"
+            "example: %s \"write hello.py and run it with uv run hello.py\" ./agent_playground\n",
+            argv[0],
+            argv[0]);
+    return 2;
+  }
+
+  if (getenv("OPENAI_API_KEY") == NULL || getenv("OPENAI_API_KEY")[0] == '\0') {
+    fprintf(stderr, "OPENAI_API_KEY is not set\n");
+    return 2;
+  }
+
+  prompt = argv[1];
+  working_dir = (argc >= 3) ? argv[2] : ".";
+
+  memset(&provider, 0, sizeof(provider));
+
+  options = chi_runtime_options_default();
+  options.provider = chi_openai_provider;
+  options.provider_user_data = &provider;
+  options.system_prompt = "You are a concise coding assistant.";
+  options.working_dir = working_dir;
+
+  runtime = chi_runtime_create(&options);
+  if (runtime == NULL) {
+    fprintf(stderr, "failed to create runtime\n");
+    chi_openai_state_reset(&provider);
+    return 1;
+  }
+
+  status = chi_runtime_subscribe(runtime, chi_cli_on_event, NULL, NULL);
+  if (status != CHI_OK) {
+    fprintf(stderr, "failed to subscribe: %s\n", chi_status_string(status));
+    chi_runtime_destroy(runtime);
+    chi_openai_state_reset(&provider);
+    return 1;
+  }
+
+  status = chi_runtime_start_session(runtime, prompt, session_id, sizeof(session_id));
+  if (status != CHI_OK) {
+    fprintf(stderr, "start_session failed: %s\n", chi_status_string(status));
+    chi_runtime_destroy(runtime);
+    chi_openai_state_reset(&provider);
+    return 1;
+  }
+
+  printf("session: %s\n", session_id);
+
+  chi_runtime_destroy(runtime);
+  chi_openai_state_reset(&provider);
+  return 0;
 }
