@@ -7,7 +7,7 @@
 - event stream callbacks (`tool_call_started`, `tool_call_finished`, `final_message`)
 - built-in `bash` tool
 
-It is intentionally small and now ships as one executable source file: `chi.c`.
+It is intentionally small.
 
 ## Build
 
