@@ -321,7 +321,7 @@ static void chi_prompt_queue_destroy(chi_prompt_queue *q) {
   memset(q, 0, sizeof(*q));
 }
 
-static int chi_prompt_queue_push(chi_prompt_queue *q, const char *prompt) {
+static int chi_prompt_queue_insert(chi_prompt_queue *q, const char *prompt, int front) {
   char *copy;
   if (q == NULL || chi_is_blank(prompt)) {
     return 0;
@@ -333,28 +333,22 @@ static int chi_prompt_queue_push(chi_prompt_queue *q, const char *prompt) {
   if (copy == NULL) {
     return 0;
   }
-  q->items[q->count++] = copy;
+  if (front && q->count > 0) {
+    memmove(q->items + 1, q->items, q->count * sizeof(char *));
+    q->items[0] = copy;
+  } else {
+    q->items[q->count] = copy;
+  }
+  q->count++;
   return 1;
 }
 
+static int chi_prompt_queue_push(chi_prompt_queue *q, const char *prompt) {
+  return chi_prompt_queue_insert(q, prompt, 0);
+}
+
 static int chi_prompt_queue_push_front(chi_prompt_queue *q, const char *prompt) {
-  char *copy;
-  if (q == NULL || chi_is_blank(prompt)) {
-    return 0;
-  }
-  if (!chi_ensure_cap((void **)&q->items, &q->cap, q->count + 1, sizeof(char *))) {
-    return 0;
-  }
-  copy = chi_strdup(prompt);
-  if (copy == NULL) {
-    return 0;
-  }
-  if (q->count > 0) {
-    memmove(q->items + 1, q->items, q->count * sizeof(char *));
-  }
-  q->items[0] = copy;
-  q->count++;
-  return 1;
+  return chi_prompt_queue_insert(q, prompt, 1);
 }
 
 static char *chi_prompt_queue_pop(chi_prompt_queue *q) {
@@ -769,10 +763,14 @@ static int chi_curl_request(
   char *url_q = NULL;
   char *req_q = NULL;
   char *resp_q = NULL;
-  FILE *pipe;
+  FILE *pipe = NULL;
   char status_buf[64];
-  int status;
+  int status = 0;
   size_t i;
+  int ok = 0;
+  int req_created = 0;
+  int resp_created = 0;
+  const char *fail_msg = NULL;
 
   *response_body = NULL;
   *http_code = 0;
@@ -781,28 +779,27 @@ static int chi_curl_request(
   if (request_body != NULL) {
     req_fd = mkstemp(req_path);
     if (req_fd < 0) {
-      *err_out = chi_strdup("failed to create request temp file");
-      return 0;
+      fail_msg = "failed to create request temp file";
+      goto cleanup;
     }
+    req_created = 1;
     close(req_fd);
     req_fd = -1;
 
     if (!chi_write_file(req_path, request_body)) {
-      unlink(req_path);
-      *err_out = chi_strdup("failed to write request body");
-      return 0;
+      fail_msg = "failed to write request body";
+      goto cleanup;
     }
   }
 
   resp_fd = mkstemp(resp_path);
   if (resp_fd < 0) {
-    if (request_body != NULL) {
-      unlink(req_path);
-    }
-    *err_out = chi_strdup("failed to create response temp file");
-    return 0;
+    fail_msg = "failed to create response temp file";
+    goto cleanup;
   }
+  resp_created = 1;
   close(resp_fd);
+  resp_fd = -1;
 
   url_q = chi_shell_quote(url);
   resp_q = chi_shell_quote(resp_path);
@@ -810,44 +807,21 @@ static int chi_curl_request(
     req_q = chi_shell_quote(req_path);
   }
   if (url_q == NULL || resp_q == NULL || (request_body != NULL && req_q == NULL)) {
-    free(url_q);
-    free(resp_q);
-    free(req_q);
-    unlink(resp_path);
-    if (request_body != NULL) {
-      unlink(req_path);
-    }
-    *err_out = chi_strdup("out of memory building curl command");
-    return 0;
+    fail_msg = "out of memory building curl command";
+    goto cleanup;
   }
 
   if (!chi_append(&cmd, &cmd_len, &cmd_cap, "curl -sS -o ") ||
       !chi_append(&cmd, &cmd_len, &cmd_cap, resp_q) ||
       !chi_append(&cmd, &cmd_len, &cmd_cap, " -w '%{http_code}'")) {
-    free(url_q);
-    free(resp_q);
-    free(req_q);
-    free(cmd);
-    unlink(resp_path);
-    if (request_body != NULL) {
-      unlink(req_path);
-    }
-    *err_out = chi_strdup("out of memory building curl command");
-    return 0;
+    fail_msg = "out of memory building curl command";
+    goto cleanup;
   }
 
   if (method != NULL && strcmp(method, "POST") == 0) {
     if (!chi_append(&cmd, &cmd_len, &cmd_cap, " -X POST")) {
-      free(url_q);
-      free(resp_q);
-      free(req_q);
-      free(cmd);
-      unlink(resp_path);
-      if (request_body != NULL) {
-        unlink(req_path);
-      }
-      *err_out = chi_strdup("out of memory building curl command");
-      return 0;
+      fail_msg = "out of memory building curl command";
+      goto cleanup;
     }
   }
 
@@ -857,16 +831,8 @@ static int chi_curl_request(
         !chi_append(&cmd, &cmd_len, &cmd_cap, " -H ") ||
         !chi_append(&cmd, &cmd_len, &cmd_cap, hq)) {
       free(hq);
-      free(url_q);
-      free(resp_q);
-      free(req_q);
-      free(cmd);
-      unlink(resp_path);
-      if (request_body != NULL) {
-        unlink(req_path);
-      }
-      *err_out = chi_strdup("out of memory building curl command");
-      return 0;
+      fail_msg = "out of memory building curl command";
+      goto cleanup;
     }
     free(hq);
   }
@@ -874,44 +840,21 @@ static int chi_curl_request(
   if (request_body != NULL) {
     if (!chi_append(&cmd, &cmd_len, &cmd_cap, " --data-binary @") ||
         !chi_append(&cmd, &cmd_len, &cmd_cap, req_q)) {
-      free(url_q);
-      free(resp_q);
-      free(req_q);
-      free(cmd);
-      unlink(resp_path);
-      unlink(req_path);
-      *err_out = chi_strdup("out of memory building curl command");
-      return 0;
+      fail_msg = "out of memory building curl command";
+      goto cleanup;
     }
   }
 
   if (!chi_append(&cmd, &cmd_len, &cmd_cap, " ") ||
       !chi_append(&cmd, &cmd_len, &cmd_cap, url_q)) {
-    free(url_q);
-    free(resp_q);
-    free(req_q);
-    free(cmd);
-    unlink(resp_path);
-    if (request_body != NULL) {
-      unlink(req_path);
-    }
-    *err_out = chi_strdup("out of memory building curl command");
-    return 0;
+    fail_msg = "out of memory building curl command";
+    goto cleanup;
   }
-
-  free(url_q);
-  free(resp_q);
-  free(req_q);
 
   pipe = popen(cmd, "r");
   if (pipe == NULL) {
-    free(cmd);
-    unlink(resp_path);
-    if (request_body != NULL) {
-      unlink(req_path);
-    }
-    *err_out = chi_strdup("failed to run curl");
-    return 0;
+    fail_msg = "failed to run curl";
+    goto cleanup;
   }
 
   memset(status_buf, 0, sizeof(status_buf));
@@ -920,28 +863,48 @@ static int chi_curl_request(
   }
 
   status = pclose(pipe);
-  free(cmd);
+  pipe = NULL;
 
   *response_body = chi_read_file(resp_path);
-  unlink(resp_path);
-  if (request_body != NULL) {
-    unlink(req_path);
-  }
-
   if (*response_body == NULL) {
-    *err_out = chi_strdup("failed to read curl response body");
-    return 0;
+    fail_msg = "failed to read curl response body";
+    goto cleanup;
   }
 
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    *err_out = chi_strdup("curl request failed");
+    fail_msg = "curl request failed";
     free(*response_body);
     *response_body = NULL;
-    return 0;
+    goto cleanup;
   }
 
   *http_code = atoi(status_buf);
-  return 1;
+  ok = 1;
+
+cleanup:
+  if (req_fd >= 0) {
+    close(req_fd);
+  }
+  if (resp_fd >= 0) {
+    close(resp_fd);
+  }
+  if (pipe != NULL) {
+    pclose(pipe);
+  }
+  free(url_q);
+  free(resp_q);
+  free(req_q);
+  free(cmd);
+  if (resp_created) {
+    unlink(resp_path);
+  }
+  if (req_created) {
+    unlink(req_path);
+  }
+  if (!ok && fail_msg != NULL) {
+    *err_out = chi_strdup(fail_msg);
+  }
+  return ok;
 }
 
 static int chi_run_shell_command(const char *cwd, const char *command, double timeout_s, chi_shell_result *out) {
@@ -1069,50 +1032,78 @@ static int chi_run_shell_command(const char *cwd, const char *command, double ti
 
 static char *chi_extract_responses_output_text(const char *json) {
   const char *p;
+  char *direct = NULL;
+  char *type = NULL;
 
-  char *direct = chi_json_get_string(json, "output_text");
+  if (json == NULL) {
+    return NULL;
+  }
+
+  type = chi_json_get_string(json, "type");
+  if (type != NULL && strcmp(type, "response.output_text.done") == 0) {
+    direct = chi_json_get_string(json, "text");
+    if (direct != NULL && direct[0] != '\0') {
+      free(type);
+      return direct;
+    }
+    free(direct);
+  }
+  free(type);
+
+  p = json;
+  while (p != NULL) {
+    char *type;
+    char *text;
+
+    p = strstr(p, "\"type\"");
+    if (p == NULL) {
+      break;
+    }
+
+    type = chi_json_get_string(p, "type");
+    if (type != NULL && strcmp(type, "output_text") == 0) {
+      text = chi_json_get_string(p, "text");
+      if (text != NULL && text[0] != '\0') {
+        free(type);
+        return text;
+      }
+      free(text);
+    }
+    free(type);
+    p += 6;
+  }
+
+  direct = chi_json_get_string(json, "output_text");
   if (direct != NULL && direct[0] != '\0') {
     return direct;
   }
   free(direct);
 
-  p = json;
-  while (p != NULL) {
-    const char *next;
-    const char *value;
-    p = strstr(p, "\"output_text\"");
-    if (p == NULL) {
-      break;
-    }
-
-    next = strstr(p, "\"text\"");
-    if (next != NULL) {
-      value = strchr(next, ':');
-      if (value != NULL) {
-        char *tmp;
-        value = chi_skip_ws(value + 1);
-        if (*value == '"') {
-          tmp = chi_json_get_string(value - 1, "text");
-          if (tmp != NULL && tmp[0] != '\0') {
-            return tmp;
-          }
-          free(tmp);
-        }
-      }
-    }
-
-    p += 13;
-  }
-
   return NULL;
 }
 
-static char *chi_extract_sse_last_payload(const char *body) {
+static int chi_sse_type_matches(const char *payload, const char *event_type) {
+  char *type;
+  int ok;
+
+  if (payload == NULL || event_type == NULL) {
+    return 0;
+  }
+  type = chi_json_get_string(payload, "type");
+  ok = (type != NULL && strcmp(type, event_type) == 0);
+  free(type);
+  return ok;
+}
+
+static char *chi_extract_sse_payload(const char *body, const char *event_type) {
   const char *line = body;
   char *last = NULL;
 
   if (body == NULL || strstr(body, "data:") == NULL) {
-    return chi_strdup(body == NULL ? "" : body);
+    if (event_type == NULL) {
+      return chi_strdup(body == NULL ? "" : body);
+    }
+    return NULL;
   }
 
   while (*line != '\0') {
@@ -1122,13 +1113,20 @@ static char *chi_extract_sse_last_payload(const char *body) {
     if (n > 5 && strncmp(line, "data:", 5) == 0) {
       const char *payload = chi_skip_ws(line + 5);
       if (strncmp(payload, "[DONE]", 6) != 0) {
-        free(last);
-        last = (char *)malloc(n - (size_t)(payload - line) + 1);
-        if (last == NULL) {
+        size_t payload_len = n - (size_t)(payload - line);
+        char *candidate = (char *)malloc(payload_len + 1);
+        if (candidate == NULL) {
+          free(last);
           return NULL;
         }
-        memcpy(last, payload, n - (size_t)(payload - line));
-        last[n - (size_t)(payload - line)] = '\0';
+        memcpy(candidate, payload, payload_len);
+        candidate[payload_len] = '\0';
+        if (event_type == NULL || chi_sse_type_matches(candidate, event_type)) {
+          free(last);
+          last = candidate;
+          candidate = NULL;
+        }
+        free(candidate);
       }
     }
 
@@ -1138,7 +1136,41 @@ static char *chi_extract_sse_last_payload(const char *body) {
     line = end + 1;
   }
 
-  return last != NULL ? last : chi_strdup(body);
+  if (last != NULL) {
+    return last;
+  }
+  if (event_type == NULL) {
+    return chi_strdup(body);
+  }
+  return NULL;
+}
+
+static char *chi_extract_provider_payload(const char *body) {
+  char *payload;
+
+  payload = chi_extract_sse_payload(body, "response.completed");
+  if (payload != NULL) {
+    return payload;
+  }
+
+  payload = chi_extract_sse_payload(body, "response.output_text.done");
+  if (payload != NULL) {
+    return payload;
+  }
+
+  return chi_extract_sse_payload(body, NULL);
+}
+
+static char *chi_extract_incomplete_reason(const char *json) {
+  const char *details;
+  if (json == NULL) {
+    return NULL;
+  }
+  details = strstr(json, "\"incomplete_details\"");
+  if (details == NULL) {
+    return NULL;
+  }
+  return chi_json_get_string(details, "reason");
 }
 
 static int chi_parse_action(const char *raw_text, chi_action *out, char **err_out) {
@@ -1264,7 +1296,7 @@ static char *chi_serialize_conversation(const chi_conversation *c) {
   return buf;
 }
 
-static char *chi_build_request_json(const chi_config *cfg, const char *conversation, char **err_out) {
+static char *chi_build_request_json(const chi_config *cfg, const char *conversation, int chatgpt_mode, char **err_out) {
   const char *instructions =
       "You are a coding agent controller with one tool: bash. "
       "Use bash to create/edit/run files. Use uv run for python. "
@@ -1291,20 +1323,40 @@ static char *chi_build_request_json(const chi_config *cfg, const char *conversat
     return NULL;
   }
 
-  json = chi_format(
-      "{"
-      "\"model\":\"%s\"," 
-      "\"input\":["
-      "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]},"
-      "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]}"
-      "],"
-      "\"reasoning\":{\"effort\":\"%s\"},"
-      "\"max_output_tokens\":900"
-      "}",
-      emodel,
-      eins,
-      econv,
-      ereasoning);
+  if (chatgpt_mode) {
+    json = chi_format(
+        "{"
+        "\"model\":\"%s\","
+        "\"instructions\":\"%s\","
+        "\"input\":["
+        "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]}"
+        "],"
+        "\"reasoning\":{\"effort\":\"%s\"},"
+        "\"store\":false,"
+        "\"stream\":true"
+        "}",
+        emodel,
+        eins,
+        eins,
+        econv,
+        ereasoning);
+  } else {
+    json = chi_format(
+        "{"
+        "\"model\":\"%s\","
+        "\"input\":["
+        "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]}"
+        "],"
+        "\"reasoning\":{\"effort\":\"%s\"},"
+        "\"max_output_tokens\":900"
+        "}",
+        emodel,
+        eins,
+        econv,
+        ereasoning);
+  }
 
   free(emodel);
   free(ereasoning);
@@ -1320,11 +1372,13 @@ static char *chi_build_request_json(const chi_config *cfg, const char *conversat
 static int chi_extract_provider_action(const char *response_body, chi_action *action, char **err_out) {
   char *payload = NULL;
   char *output_text = NULL;
+  char *status = NULL;
+  char *reason = NULL;
   int ok;
 
   *err_out = NULL;
 
-  payload = chi_extract_sse_last_payload(response_body);
+  payload = chi_extract_provider_payload(response_body);
   if (payload == NULL) {
     *err_out = chi_strdup("failed to parse provider payload");
     return 0;
@@ -1332,30 +1386,49 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
 
   output_text = chi_extract_responses_output_text(payload);
   if (output_text == NULL) {
-    output_text = chi_json_get_string(payload, "text");
-  }
-  if (output_text == NULL) {
-    output_text = chi_json_get_string(payload, "message");
+    status = chi_json_get_string(payload, "status");
+    reason = chi_extract_incomplete_reason(payload);
+    if (status != NULL && strcmp(status, "incomplete") == 0) {
+      if (reason != NULL && strcmp(reason, "max_output_tokens") == 0) {
+        *err_out = chi_strdup(
+            "provider response incomplete (max_output_tokens reached); increase token budget or lower reasoning effort");
+      } else if (!chi_is_blank(reason)) {
+        *err_out = chi_format("provider response incomplete: %s", reason);
+      } else {
+        *err_out = chi_strdup("provider response incomplete");
+      }
+    }
   }
 
   if (output_text == NULL) {
+    free(status);
+    free(reason);
     free(payload);
-    *err_out = chi_format("could not parse output text from provider response: %s", response_body);
+    if (*err_out == NULL) {
+      *err_out = chi_format("could not parse output text from provider response: %s", response_body);
+    }
     return 0;
   }
 
+  free(status);
+  free(reason);
   ok = chi_parse_action(output_text, action, err_out);
   free(payload);
   free(output_text);
   return ok;
 }
 
-static int chi_provider_openai(
+static int chi_provider_request_with_auth(
     const chi_config *cfg,
     const chi_conversation *conversation,
+    const char *auth_token,
+    const char *url_env,
+    const char *default_url,
+    const char *request_failed_msg,
+    const char *http_label,
+    int chatgpt_mode,
     chi_action *action,
     char **err_out) {
-  const char *api_key;
   const char *url;
   char *conv_text = NULL;
   char *req_json = NULL;
@@ -1368,26 +1441,20 @@ static int chi_provider_openai(
 
   *err_out = NULL;
 
-  api_key = getenv("OPENAI_API_KEY");
-  if (chi_is_blank(api_key)) {
-    *err_out = chi_strdup("OPENAI_API_KEY is not set");
-    return 0;
-  }
-
   conv_text = chi_serialize_conversation(conversation);
   if (conv_text == NULL) {
     *err_out = chi_strdup("out of memory while serializing conversation");
     return 0;
   }
 
-  req_json = chi_build_request_json(cfg, conv_text, &tmp_err);
+  req_json = chi_build_request_json(cfg, conv_text, chatgpt_mode, &tmp_err);
   free(conv_text);
   if (req_json == NULL) {
     *err_out = tmp_err;
     return 0;
   }
 
-  auth = chi_format("Authorization: Bearer %s", api_key);
+  auth = chi_format("Authorization: Bearer %s", auth_token);
   if (auth == NULL) {
     free(req_json);
     *err_out = chi_strdup("out of memory while building auth header");
@@ -1396,20 +1463,20 @@ static int chi_provider_openai(
 
   headers[0] = auth;
   headers[1] = "Content-Type: application/json";
-  url = getenv("OPENAI_API_URL");
+  url = getenv(url_env);
   if (chi_is_blank(url)) {
-    url = "https://api.openai.com/v1/responses";
+    url = default_url;
   }
 
   if (!chi_curl_request("POST", url, headers, 2, req_json, &resp_json, &http_code, &tmp_err)) {
-    *err_out = tmp_err != NULL ? tmp_err : chi_strdup("openai request failed");
+    *err_out = tmp_err != NULL ? tmp_err : chi_strdup(request_failed_msg);
     free(req_json);
     free(auth);
     return 0;
   }
 
   if (http_code < 200 || http_code >= 300) {
-    *err_out = chi_format("openai http %d: %s", http_code, resp_json);
+    *err_out = chi_format("%s http %d: %s", http_label, http_code, resp_json);
     free(req_json);
     free(auth);
     free(resp_json);
@@ -1425,6 +1492,29 @@ static int chi_provider_openai(
   free(auth);
   free(resp_json);
   return ok;
+}
+
+static int chi_provider_openai(
+    const chi_config *cfg,
+    const chi_conversation *conversation,
+    chi_action *action,
+    char **err_out) {
+  const char *api_key = getenv("OPENAI_API_KEY");
+  if (chi_is_blank(api_key)) {
+    *err_out = chi_strdup("OPENAI_API_KEY is not set");
+    return 0;
+  }
+  return chi_provider_request_with_auth(
+      cfg,
+      conversation,
+      api_key,
+      "OPENAI_API_URL",
+      "https://api.openai.com/v1/responses",
+      "openai request failed",
+      "openai",
+      0,
+      action,
+      err_out);
 }
 
 static int chi_resolve_chatgpt_access_token(chi_config *cfg, char **token_out, char **err_out) {
@@ -1515,77 +1605,26 @@ static int chi_provider_chatgpt(
     const chi_conversation *conversation,
     chi_action *action,
     char **err_out) {
-  const char *url;
   char *token = NULL;
-  char *conv_text = NULL;
-  char *req_json = NULL;
-  char *resp_json = NULL;
-  char *auth = NULL;
-  char *tmp_err = NULL;
-  const char *headers[2];
-  int http_code = 0;
-  int ok = 0;
+  int ok;
 
   *err_out = NULL;
 
   if (!chi_resolve_chatgpt_access_token(cfg, &token, err_out)) {
     return 0;
   }
-
-  conv_text = chi_serialize_conversation(conversation);
-  if (conv_text == NULL) {
-    free(token);
-    *err_out = chi_strdup("out of memory while serializing conversation");
-    return 0;
-  }
-
-  req_json = chi_build_request_json(cfg, conv_text, &tmp_err);
-  free(conv_text);
-  if (req_json == NULL) {
-    free(token);
-    *err_out = tmp_err;
-    return 0;
-  }
-
-  auth = chi_format("Authorization: Bearer %s", token);
+  ok = chi_provider_request_with_auth(
+      cfg,
+      conversation,
+      token,
+      "CHATGPT_API_URL",
+      "https://chatgpt.com/backend-api/codex/responses",
+      "chatgpt request failed",
+      "chatgpt",
+      1,
+      action,
+      err_out);
   free(token);
-  if (auth == NULL) {
-    free(req_json);
-    *err_out = chi_strdup("out of memory while building auth header");
-    return 0;
-  }
-
-  headers[0] = auth;
-  headers[1] = "Content-Type: application/json";
-
-  url = getenv("CHATGPT_API_URL");
-  if (chi_is_blank(url)) {
-    url = "https://chatgpt.com/backend-api/codex/responses";
-  }
-
-  if (!chi_curl_request("POST", url, headers, 2, req_json, &resp_json, &http_code, &tmp_err)) {
-    *err_out = tmp_err != NULL ? tmp_err : chi_strdup("chatgpt request failed");
-    free(req_json);
-    free(auth);
-    return 0;
-  }
-
-  if (http_code < 200 || http_code >= 300) {
-    *err_out = chi_format("chatgpt http %d: %s", http_code, resp_json);
-    free(req_json);
-    free(auth);
-    free(resp_json);
-    return 0;
-  }
-
-  ok = chi_extract_provider_action(resp_json, action, &tmp_err);
-  if (!ok) {
-    *err_out = tmp_err;
-  }
-
-  free(req_json);
-  free(auth);
-  free(resp_json);
   return ok;
 }
 
@@ -1693,6 +1732,29 @@ static void chi_usage(const char *argv0) {
           argv0);
 }
 
+static int chi_arg_fail(chi_prompt_queue *queue, const char *msg) {
+  fprintf(stderr, "%s\n", msg);
+  chi_prompt_queue_destroy(queue);
+  return 2;
+}
+
+static int chi_arg_usage_fail(chi_prompt_queue *queue, const char *argv0) {
+  chi_usage(argv0);
+  chi_prompt_queue_destroy(queue);
+  return 2;
+}
+
+static int chi_queue_pop_to_conversation(chi_prompt_queue *queue, chi_conversation *convo) {
+  char *prompt = chi_prompt_queue_pop(queue);
+  int ok;
+  if (prompt == NULL) {
+    return 0;
+  }
+  ok = chi_conversation_add(convo, "user", prompt, NULL, NULL, NULL);
+  free(prompt);
+  return ok;
+}
+
 int main(int argc, char **argv) {
   chi_config cfg;
   chi_conversation convo;
@@ -1735,9 +1797,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--backend") == 0) {
       if (i + 1 >= argc || !chi_parse_backend(argv[i + 1], &cfg.backend)) {
-        fprintf(stderr, "invalid --backend value\n");
-        chi_prompt_queue_destroy(&queue);
-        return 2;
+        return chi_arg_fail(&queue, "invalid --backend value");
       }
       i++;
       continue;
@@ -1745,9 +1805,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--model") == 0) {
       if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
-        fprintf(stderr, "missing --model value\n");
-        chi_prompt_queue_destroy(&queue);
-        return 2;
+        return chi_arg_fail(&queue, "missing --model value");
       }
       cfg.model = argv[++i];
       continue;
@@ -1755,9 +1813,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--reasoning") == 0) {
       if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
-        fprintf(stderr, "missing --reasoning value\n");
-        chi_prompt_queue_destroy(&queue);
-        return 2;
+        return chi_arg_fail(&queue, "missing --reasoning value");
       }
       cfg.reasoning_effort = argv[++i];
       continue;
@@ -1765,24 +1821,18 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--max-turns") == 0) {
       if (i + 1 >= argc) {
-        fprintf(stderr, "missing --max-turns value\n");
-        chi_prompt_queue_destroy(&queue);
-        return 2;
+        return chi_arg_fail(&queue, "missing --max-turns value");
       }
       max_turns = atoi(argv[++i]);
       if (max_turns <= 0) {
-        fprintf(stderr, "--max-turns must be > 0\n");
-        chi_prompt_queue_destroy(&queue);
-        return 2;
+        return chi_arg_fail(&queue, "--max-turns must be > 0");
       }
       continue;
     }
 
     if (strcmp(argv[i], "--queue") == 0) {
       if (i + 1 >= argc || !chi_prompt_queue_push(&queue, argv[i + 1])) {
-        fprintf(stderr, "missing or invalid --queue value\n");
-        chi_prompt_queue_destroy(&queue);
-        return 2;
+        return chi_arg_fail(&queue, "missing or invalid --queue value");
       }
       i++;
       continue;
@@ -1799,15 +1849,11 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "unexpected argument: %s\n", argv[i]);
-    chi_usage(argv[0]);
-    chi_prompt_queue_destroy(&queue);
-    return 2;
+    return chi_arg_usage_fail(&queue, argv[0]);
   }
 
   if (chi_is_blank(prompt)) {
-    chi_usage(argv[0]);
-    chi_prompt_queue_destroy(&queue);
-    return 2;
+    return chi_arg_usage_fail(&queue, argv[0]);
   }
 
   if (!chi_prompt_queue_push_front(&queue, prompt)) {
@@ -1821,18 +1867,14 @@ int main(int argc, char **argv) {
   printf("session: %s\n", cfg.session_id);
 
   while (queue.count > 0) {
-    char *queued_prompt = chi_prompt_queue_pop(&queue);
     int finalized = 0;
     int turn;
 
-    if (queued_prompt == NULL ||
-        !chi_conversation_add(&convo, "user", queued_prompt, NULL, NULL, NULL)) {
-      free(queued_prompt);
+    if (!chi_queue_pop_to_conversation(&queue, &convo)) {
       fprintf(stderr, "failed to append queued user message\n");
       exit_code = 1;
       goto cleanup;
     }
-    free(queued_prompt);
 
     for (turn = 0; turn < max_turns; turn++) {
       chi_action action;
@@ -1862,31 +1904,27 @@ int main(int argc, char **argv) {
       }
 
       {
-        char *call_id;
+        char *call_id = NULL;
         char *args_json = NULL;
         char *escaped_command = NULL;
         char *tool_output = NULL;
         char *tool_error = NULL;
         char *tool_record = NULL;
         int is_error = 0;
+        int tool_step_ok = 0;
         double timeout = action.timeout_seconds > 0 ? action.timeout_seconds : 0;
 
         call_seq++;
         call_id = chi_format("call_%llu", call_seq);
         if (call_id == NULL) {
           fprintf(stderr, "out of memory generating tool call id\n");
-          chi_action_reset(&action);
-          exit_code = 1;
-          goto cleanup;
+          goto tool_cleanup;
         }
 
         printf("[tool start] %s (%s)\n", action.tool_name, call_id);
         if (!chi_run_bash(cfg.working_dir, action.tool_command, timeout, &tool_output, &is_error, &tool_error)) {
-          free(call_id);
-          chi_action_reset(&action);
           fprintf(stderr, "failed to run tool\n");
-          exit_code = 1;
-          goto cleanup;
+          goto tool_cleanup;
         }
 
         printf("[tool done] %s (%s) error=%d\n", action.tool_name, call_id, is_error);
@@ -1917,43 +1955,31 @@ int main(int argc, char **argv) {
                 call_id,
                 action.tool_name,
                 args_json == NULL ? "{}" : args_json)) {
-          free(call_id);
-          free(args_json);
-          free(escaped_command);
-          free(tool_output);
-          free(tool_error);
-          free(tool_record);
-          chi_action_reset(&action);
           fprintf(stderr, "failed to append tool result\n");
-          exit_code = 1;
-          goto cleanup;
+          goto tool_cleanup;
         }
 
         if (queue.count > 0) {
-          char *injected_prompt = chi_prompt_queue_pop(&queue);
-          if (injected_prompt == NULL ||
-              !chi_conversation_add(&convo, "user", injected_prompt, NULL, NULL, NULL)) {
-            free(injected_prompt);
-            free(call_id);
-            free(args_json);
-            free(escaped_command);
-            free(tool_output);
-            free(tool_error);
-            free(tool_record);
-            chi_action_reset(&action);
+          if (!chi_queue_pop_to_conversation(&queue, &convo)) {
             fprintf(stderr, "failed to inject queued user message\n");
-            exit_code = 1;
-            goto cleanup;
+            goto tool_cleanup;
           }
-          free(injected_prompt);
         }
 
+        tool_step_ok = 1;
+
+      tool_cleanup:
         free(call_id);
         free(args_json);
         free(escaped_command);
         free(tool_output);
         free(tool_error);
         free(tool_record);
+        if (!tool_step_ok) {
+          chi_action_reset(&action);
+          exit_code = 1;
+          goto cleanup;
+        }
       }
 
       chi_action_reset(&action);
