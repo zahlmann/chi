@@ -55,6 +55,7 @@ typedef struct {
 typedef struct {
   int is_tool;
   char *assistant_text;
+  char *reasoning_summary;
   char *final_text;
   char *tool_call_id;
   char *tool_name;
@@ -1386,6 +1387,172 @@ static char *chi_extract_sse_output_text_deltas(const char *body) {
   return out;
 }
 
+static char *chi_extract_responses_reasoning_summary_text(const char *json) {
+  const char *p;
+  char *out = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  if (json == NULL) {
+    return NULL;
+  }
+
+  p = json;
+  while (p != NULL) {
+    char *type;
+    char *text;
+
+    p = strstr(p, "\"type\"");
+    if (p == NULL) {
+      break;
+    }
+
+    type = chi_json_get_string(p, "type");
+    if (type != NULL && strcmp(type, "summary_text") == 0) {
+      text = chi_json_get_string(p, "text");
+      if (!chi_is_blank(text)) {
+        if (len > 0 && !chi_append(&out, &len, &cap, "\n")) {
+          free(type);
+          free(text);
+          free(out);
+          return NULL;
+        }
+        if (!chi_append(&out, &len, &cap, text)) {
+          free(type);
+          free(text);
+          free(out);
+          return NULL;
+        }
+      }
+      free(text);
+    }
+    free(type);
+    p += 6;
+  }
+
+  if (chi_is_blank(out)) {
+    free(out);
+    return NULL;
+  }
+  return out;
+}
+
+static char *chi_extract_sse_reasoning_summary_done(const char *body) {
+  const char *line = body;
+  char *out = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  if (body == NULL || strstr(body, "data:") == NULL) {
+    return NULL;
+  }
+
+  while (*line != '\0') {
+    const char *end = strchr(line, '\n');
+    size_t n = end == NULL ? strlen(line) : (size_t)(end - line);
+
+    if (n > 5 && strncmp(line, "data:", 5) == 0) {
+      const char *payload = chi_skip_ws(line + 5);
+      if (strncmp(payload, "[DONE]", 6) != 0) {
+        size_t payload_len = n - (size_t)(payload - line);
+        char *candidate = (char *)malloc(payload_len + 1);
+        if (candidate == NULL) {
+          free(out);
+          return NULL;
+        }
+        memcpy(candidate, payload, payload_len);
+        candidate[payload_len] = '\0';
+
+        if (chi_sse_type_matches(candidate, "response.reasoning_summary_text.done")) {
+          char *text = chi_json_get_string(candidate, "text");
+          if (!chi_is_blank(text)) {
+            if (len > 0 && !chi_append(&out, &len, &cap, "\n")) {
+              free(text);
+              free(candidate);
+              free(out);
+              return NULL;
+            }
+            if (!chi_append(&out, &len, &cap, text)) {
+              free(text);
+              free(candidate);
+              free(out);
+              return NULL;
+            }
+          }
+          free(text);
+        }
+        free(candidate);
+      }
+    }
+
+    if (end == NULL) {
+      break;
+    }
+    line = end + 1;
+  }
+
+  if (chi_is_blank(out)) {
+    free(out);
+    return NULL;
+  }
+  return out;
+}
+
+static char *chi_extract_sse_reasoning_summary_deltas(const char *body) {
+  const char *line = body;
+  char *out = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  if (body == NULL || strstr(body, "data:") == NULL) {
+    return NULL;
+  }
+
+  while (*line != '\0') {
+    const char *end = strchr(line, '\n');
+    size_t n = end == NULL ? strlen(line) : (size_t)(end - line);
+
+    if (n > 5 && strncmp(line, "data:", 5) == 0) {
+      const char *payload = chi_skip_ws(line + 5);
+      if (strncmp(payload, "[DONE]", 6) != 0) {
+        size_t payload_len = n - (size_t)(payload - line);
+        char *candidate = (char *)malloc(payload_len + 1);
+        if (candidate == NULL) {
+          free(out);
+          return NULL;
+        }
+        memcpy(candidate, payload, payload_len);
+        candidate[payload_len] = '\0';
+
+        if (chi_sse_type_matches(candidate, "response.reasoning_summary_text.delta")) {
+          char *delta = chi_json_get_string(candidate, "delta");
+          if (!chi_is_blank(delta)) {
+            if (!chi_append(&out, &len, &cap, delta)) {
+              free(delta);
+              free(candidate);
+              free(out);
+              return NULL;
+            }
+          }
+          free(delta);
+        }
+        free(candidate);
+      }
+    }
+
+    if (end == NULL) {
+      break;
+    }
+    line = end + 1;
+  }
+
+  if (chi_is_blank(out)) {
+    free(out);
+    return NULL;
+  }
+  return out;
+}
+
 static char *chi_extract_incomplete_reason(const char *json) {
   const char *details;
   if (json == NULL) {
@@ -1465,6 +1632,7 @@ static void chi_action_reset(chi_action *a) {
     return;
   }
   free(a->assistant_text);
+  free(a->reasoning_summary);
   free(a->final_text);
   free(a->tool_call_id);
   free(a->tool_name);
@@ -1693,6 +1861,8 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
   if (reasoning_effort != NULL) {
     if (!chi_append(&json, &len, &cap, ",\"reasoning\":{\"effort\":") ||
         !chi_append_json_quoted(&json, &len, &cap, reasoning_effort) ||
+        (!chi_equals_ignore_case(reasoning_effort, "none") &&
+         (!chi_append(&json, &len, &cap, ",\"summary\":\"auto\""))) ||
         !chi_append(&json, &len, &cap, "}")) {
       free(json);
       *err_out = chi_strdup("out of memory while building provider request");
@@ -1713,6 +1883,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
   char *tool_payload = NULL;
   char *output_done_payload = NULL;
   char *output_text = NULL;
+  char *reasoning_summary = NULL;
   char *status = NULL;
   char *reason = NULL;
   char *call_id = NULL;
@@ -1749,9 +1920,18 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
   if (output_text == NULL) {
     output_text = chi_extract_sse_output_text_deltas(response_body);
   }
+  reasoning_summary = chi_extract_responses_reasoning_summary_text(payload);
+  if (reasoning_summary == NULL) {
+    reasoning_summary = chi_extract_sse_reasoning_summary_done(response_body);
+  }
+  if (reasoning_summary == NULL) {
+    reasoning_summary = chi_extract_sse_reasoning_summary_deltas(response_body);
+  }
 
   if (has_tool) {
     action->assistant_text = output_text != NULL ? output_text : chi_strdup("");
+    action->reasoning_summary = reasoning_summary;
+    reasoning_summary = NULL;
     output_text = NULL;
     action->tool_call_id = call_id;
     action->tool_name = tool_name;
@@ -1765,6 +1945,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
       *err_out = chi_strdup("out of memory while parsing tool call");
       free(status);
       free(reason);
+      free(reasoning_summary);
       free(payload);
       free(tool_payload);
       free(output_done_payload);
@@ -1782,6 +1963,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
         *err_out = chi_strdup("out of memory while parsing tool call");
         free(status);
         free(reason);
+        free(reasoning_summary);
         free(payload);
         free(tool_payload);
         free(output_done_payload);
@@ -1809,6 +1991,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
 
     free(status);
     free(reason);
+    free(reasoning_summary);
     free(payload);
     free(tool_payload);
     free(output_done_payload);
@@ -1851,10 +2034,15 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
   free(status);
   free(reason);
   ok = chi_parse_action(output_text, action, err_out);
+  if (ok) {
+    action->reasoning_summary = reasoning_summary;
+    reasoning_summary = NULL;
+  }
   free(payload);
   free(tool_payload);
   free(output_done_payload);
   free(output_text);
+  free(reasoning_summary);
   free(call_id);
   free(tool_name);
   free(arguments_json);
@@ -2346,6 +2534,10 @@ int main(int argc, char **argv) {
         chi_action_reset(&action);
         exit_code = 1;
         goto cleanup;
+      }
+
+      if (!chi_is_blank(action.reasoning_summary)) {
+        printf("[thinking]\n%s\n", action.reasoning_summary);
       }
 
       if (!action.is_tool) {

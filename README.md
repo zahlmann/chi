@@ -6,6 +6,7 @@
 - tool-call loop (`assistant -> bash -> assistant`)
 - switchable backends (`openai`, `chatgpt`)
 - built-in `bash` tool
+- optional model reasoning summaries printed as `[thinking]` (when provided by the API)
 
 It is intentionally small.
 
