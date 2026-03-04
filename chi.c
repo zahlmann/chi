@@ -56,7 +56,9 @@ typedef struct {
   int is_tool;
   char *assistant_text;
   char *final_text;
+  char *tool_call_id;
   char *tool_name;
+  char *tool_arguments_json;
   char *tool_command;
   double timeout_seconds;
 } chi_action;
@@ -99,6 +101,23 @@ static int chi_is_blank(const char *s) {
     s++;
   }
   return 1;
+}
+
+static int chi_equals_ignore_case(const char *a, const char *b) {
+  unsigned char ca;
+  unsigned char cb;
+
+  if (a == NULL || b == NULL) {
+    return 0;
+  }
+  while (*a != '\0' && *b != '\0') {
+    ca = (unsigned char)*a++;
+    cb = (unsigned char)*b++;
+    if (tolower(ca) != tolower(cb)) {
+      return 0;
+    }
+  }
+  return *a == '\0' && *b == '\0';
 }
 
 static char *chi_format(const char *fmt, ...) {
@@ -1180,6 +1199,59 @@ static char *chi_extract_responses_output_text(const char *json) {
   return NULL;
 }
 
+static int chi_extract_responses_function_call(
+    const char *json,
+    char **call_id_out,
+    char **tool_name_out,
+    char **arguments_json_out) {
+  const char *p;
+
+  *call_id_out = NULL;
+  *tool_name_out = NULL;
+  *arguments_json_out = NULL;
+
+  if (json == NULL) {
+    return 0;
+  }
+
+  p = json;
+  while (p != NULL) {
+    char *type;
+
+    p = strstr(p, "\"type\"");
+    if (p == NULL) {
+      break;
+    }
+
+    type = chi_json_get_string(p, "type");
+    if (type != NULL && strcmp(type, "function_call") == 0) {
+      char *call_id = chi_json_get_string(p, "call_id");
+      char *tool_name = chi_json_get_string(p, "name");
+      char *arguments = chi_json_get_string(p, "arguments");
+      free(type);
+
+      if (chi_is_blank(arguments)) {
+        free(arguments);
+        arguments = chi_strdup("{}");
+      }
+      if (arguments == NULL) {
+        free(call_id);
+        free(tool_name);
+        return 0;
+      }
+
+      *call_id_out = call_id;
+      *tool_name_out = tool_name;
+      *arguments_json_out = arguments;
+      return 1;
+    }
+    free(type);
+    p += 6;
+  }
+
+  return 0;
+}
+
 static int chi_sse_type_matches(const char *payload, const char *event_type) {
   char *type;
   int ok;
@@ -1257,6 +1329,61 @@ static char *chi_extract_provider_payload(const char *body) {
   }
 
   return chi_extract_sse_payload(body, NULL);
+}
+
+static char *chi_extract_sse_output_text_deltas(const char *body) {
+  const char *line = body;
+  char *out = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  if (body == NULL || strstr(body, "data:") == NULL) {
+    return NULL;
+  }
+
+  while (*line != '\0') {
+    const char *end = strchr(line, '\n');
+    size_t n = end == NULL ? strlen(line) : (size_t)(end - line);
+
+    if (n > 5 && strncmp(line, "data:", 5) == 0) {
+      const char *payload = chi_skip_ws(line + 5);
+      if (strncmp(payload, "[DONE]", 6) != 0) {
+        size_t payload_len = n - (size_t)(payload - line);
+        char *candidate = (char *)malloc(payload_len + 1);
+        if (candidate == NULL) {
+          free(out);
+          return NULL;
+        }
+        memcpy(candidate, payload, payload_len);
+        candidate[payload_len] = '\0';
+
+        if (chi_sse_type_matches(candidate, "response.output_text.delta")) {
+          char *delta = chi_json_get_string(candidate, "delta");
+          if (!chi_is_blank(delta)) {
+            if (!chi_append(&out, &len, &cap, delta)) {
+              free(delta);
+              free(candidate);
+              free(out);
+              return NULL;
+            }
+          }
+          free(delta);
+        }
+        free(candidate);
+      }
+    }
+
+    if (end == NULL) {
+      break;
+    }
+    line = end + 1;
+  }
+
+  if (chi_is_blank(out)) {
+    free(out);
+    return NULL;
+  }
+  return out;
 }
 
 static char *chi_extract_incomplete_reason(const char *json) {
@@ -1339,142 +1466,264 @@ static void chi_action_reset(chi_action *a) {
   }
   free(a->assistant_text);
   free(a->final_text);
+  free(a->tool_call_id);
   free(a->tool_name);
+  free(a->tool_arguments_json);
   free(a->tool_command);
   memset(a, 0, sizeof(*a));
 }
 
-static char *chi_serialize_conversation(const chi_conversation *c) {
+static int chi_append_json_quoted(char **buf, size_t *len, size_t *cap, const char *value) {
+  char *escaped = chi_json_escape(value == NULL ? "" : value);
+  int ok;
+  if (escaped == NULL) {
+    return 0;
+  }
+  ok = chi_append(buf, len, cap, "\"") &&
+       chi_append(buf, len, cap, escaped) &&
+       chi_append(buf, len, cap, "\"");
+  free(escaped);
+  return ok;
+}
+
+static const char *chi_normalize_reasoning_effort(const char *raw) {
+  if (chi_equals_ignore_case(raw, "none")) {
+    return "none";
+  }
+  if (chi_equals_ignore_case(raw, "minimal")) {
+    return "minimal";
+  }
+  if (chi_equals_ignore_case(raw, "low")) {
+    return "low";
+  }
+  if (chi_equals_ignore_case(raw, "medium")) {
+    return "medium";
+  }
+  if (chi_equals_ignore_case(raw, "high")) {
+    return "high";
+  }
+  if (chi_equals_ignore_case(raw, "xhigh")) {
+    return "xhigh";
+  }
+  return NULL;
+}
+
+static int chi_append_input_item_start(
+    char **buf,
+    size_t *len,
+    size_t *cap,
+    int *first_item) {
+  if (!*first_item) {
+    if (!chi_append(buf, len, cap, ",")) {
+      return 0;
+    }
+  }
+  *first_item = 0;
+  return 1;
+}
+
+static int chi_append_responses_user_message(
+    const chi_message *m,
+    char **buf,
+    size_t *len,
+    size_t *cap,
+    int *first_item) {
+  if (chi_is_blank(m->text)) {
+    return 1;
+  }
+  if (!chi_append_input_item_start(buf, len, cap, first_item) ||
+      !chi_append(buf, len, cap, "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":") ||
+      !chi_append_json_quoted(buf, len, cap, m->text) ||
+      !chi_append(buf, len, cap, "}]}")) {
+    return 0;
+  }
+  return 1;
+}
+
+static int chi_append_responses_assistant_message(
+    const chi_message *m,
+    size_t index,
+    char **buf,
+    size_t *len,
+    size_t *cap,
+    int *first_item) {
+  if (!chi_is_blank(m->text)) {
+    if (!chi_append_input_item_start(buf, len, cap, first_item) ||
+        !chi_append(buf, len, cap, "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":") ||
+        !chi_append_json_quoted(buf, len, cap, m->text) ||
+        !chi_append(buf, len, cap, "}]}")) {
+      return 0;
+    }
+  }
+
+  if (!chi_is_blank(m->tool_name)) {
+    char fallback_call_id[64];
+    const char *call_id = m->tool_call_id;
+    const char *tool_name = m->tool_name;
+    const char *arguments = m->arguments_json;
+    if (chi_is_blank(call_id)) {
+      snprintf(fallback_call_id, sizeof(fallback_call_id), "call_%zu", index + 1);
+      call_id = fallback_call_id;
+    }
+    if (chi_is_blank(tool_name)) {
+      tool_name = "tool";
+    }
+    if (chi_is_blank(arguments)) {
+      arguments = "{}";
+    }
+
+    if (!chi_append_input_item_start(buf, len, cap, first_item) ||
+        !chi_append(buf, len, cap, "{\"type\":\"function_call\",\"call_id\":") ||
+        !chi_append_json_quoted(buf, len, cap, call_id) ||
+        !chi_append(buf, len, cap, ",\"name\":") ||
+        !chi_append_json_quoted(buf, len, cap, tool_name) ||
+        !chi_append(buf, len, cap, ",\"arguments\":") ||
+        !chi_append_json_quoted(buf, len, cap, arguments) ||
+        !chi_append(buf, len, cap, "}")) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+static int chi_append_responses_tool_result(
+    const chi_message *m,
+    char **buf,
+    size_t *len,
+    size_t *cap,
+    int *first_item) {
+  const char *output;
+  if (chi_is_blank(m->tool_call_id)) {
+    return 1;
+  }
+  output = chi_is_blank(m->text) ? "(no content)" : m->text;
+
+  if (!chi_append_input_item_start(buf, len, cap, first_item) ||
+      !chi_append(buf, len, cap, "{\"type\":\"function_call_output\",\"call_id\":") ||
+      !chi_append_json_quoted(buf, len, cap, m->tool_call_id) ||
+      !chi_append(buf, len, cap, ",\"output\":") ||
+      !chi_append_json_quoted(buf, len, cap, output) ||
+      !chi_append(buf, len, cap, "}")) {
+    return 0;
+  }
+  return 1;
+}
+
+static int chi_append_responses_input(
+    const chi_conversation *conversation,
+    char **buf,
+    size_t *len,
+    size_t *cap) {
   size_t i;
-  char *buf = NULL;
+  int first_item = 1;
+
+  if (!chi_append(buf, len, cap, "\"input\":[")) {
+    return 0;
+  }
+
+  for (i = 0; i < conversation->count; i++) {
+    const chi_message *m = &conversation->items[i];
+    if (strcmp(m->role, "user") == 0) {
+      if (!chi_append_responses_user_message(m, buf, len, cap, &first_item)) {
+        return 0;
+      }
+      continue;
+    }
+    if (strcmp(m->role, "assistant") == 0) {
+      if (!chi_append_responses_assistant_message(m, i, buf, len, cap, &first_item)) {
+        return 0;
+      }
+      continue;
+    }
+    if (strcmp(m->role, "toolResult") == 0) {
+      if (!chi_append_responses_tool_result(m, buf, len, cap, &first_item)) {
+        return 0;
+      }
+      continue;
+    }
+  }
+
+  if (!chi_append(buf, len, cap, "]")) {
+    return 0;
+  }
+  return 1;
+}
+
+static char *chi_build_request_json(const chi_config *cfg, const chi_conversation *conversation, char **err_out) {
+  const char *instructions =
+      "You are a coding agent controller with one tool: bash. "
+      "Use bash to create/edit/run files. Use uv run for python.";
+  const char *reasoning_effort = chi_normalize_reasoning_effort(cfg->reasoning_effort);
+  const char *bash_tool_json =
+      "{\"type\":\"function\","
+      "\"name\":\"bash\","
+      "\"description\":\"Execute a bash command in the working directory and return stdout/stderr.\","
+      "\"parameters\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"command\":{\"type\":\"string\",\"description\":\"Bash command to execute\"},"
+      "\"timeout\":{\"type\":\"number\",\"description\":\"Timeout in seconds (optional, no default timeout)\"}"
+      "},"
+      "\"required\":[\"command\"]"
+      "}"
+      "}";
+  char *json = NULL;
   size_t len = 0;
   size_t cap = 0;
 
-  if (!chi_append(&buf, &len, &cap, "Conversation so far:\n")) {
-    free(buf);
-    return NULL;
-  }
-
-  for (i = 0; i < c->count; i++) {
-    const chi_message *m = &c->items[i];
-    if (!chi_append(&buf, &len, &cap, "- ") ||
-        !chi_append(&buf, &len, &cap, m->role) ||
-        !chi_append(&buf, &len, &cap, ": ") ||
-        !chi_append(&buf, &len, &cap, m->text == NULL ? "" : m->text) ||
-        !chi_append(&buf, &len, &cap, "\n")) {
-      free(buf);
-      return NULL;
-    }
-    if (!chi_is_blank(m->tool_name)) {
-      if (!chi_append(&buf, &len, &cap, "  tool=") ||
-          !chi_append(&buf, &len, &cap, m->tool_name) ||
-          !chi_append(&buf, &len, &cap, "\n")) {
-        free(buf);
-        return NULL;
-      }
-    }
-    if (!chi_is_blank(m->arguments_json)) {
-      if (!chi_append(&buf, &len, &cap, "  args=") ||
-          !chi_append(&buf, &len, &cap, m->arguments_json) ||
-          !chi_append(&buf, &len, &cap, "\n")) {
-        free(buf);
-        return NULL;
-      }
-    }
-  }
-
-  if (!chi_append(&buf, &len, &cap,
-                  "\nReturn exactly one JSON object and no markdown.\n"
-                  "If shell work is needed: {\"kind\":\"tool\",\"name\":\"bash\",\"command\":\"...\",\"timeout\":number(optional)}\n"
-                  "If task is done: {\"kind\":\"final\",\"text\":\"...\"}\n")) {
-    free(buf);
-    return NULL;
-  }
-
-  return buf;
-}
-
-static char *chi_build_request_json(const chi_config *cfg, const char *conversation, int chatgpt_mode, char **err_out) {
-  const char *instructions =
-      "You are a coding agent controller with one tool: bash. "
-      "Use bash to create/edit/run files. Use uv run for python. "
-      "Only return valid JSON.";
-  char *emodel = NULL;
-  char *ereasoning = NULL;
-  char *eins = NULL;
-  char *econv = NULL;
-  char *json = NULL;
-
   *err_out = NULL;
 
-  emodel = chi_json_escape(cfg->model);
-  ereasoning = chi_json_escape(cfg->reasoning_effort);
-  eins = chi_json_escape(instructions);
-  econv = chi_json_escape(conversation);
-
-  if (emodel == NULL || ereasoning == NULL || eins == NULL || econv == NULL) {
-    free(emodel);
-    free(ereasoning);
-    free(eins);
-    free(econv);
+  if (!chi_append(&json, &len, &cap, "{") ||
+      !chi_append(&json, &len, &cap, "\"model\":") ||
+      !chi_append_json_quoted(&json, &len, &cap, cfg->model) ||
+      !chi_append(&json, &len, &cap, ",\"instructions\":") ||
+      !chi_append_json_quoted(&json, &len, &cap, instructions) ||
+      !chi_append(&json, &len, &cap, ",") ||
+      !chi_append_responses_input(conversation, &json, &len, &cap) ||
+      !chi_append(&json, &len, &cap, ",\"tools\":[") ||
+      !chi_append(&json, &len, &cap, bash_tool_json) ||
+      !chi_append(&json, &len, &cap, "]") ||
+      !chi_append(&json, &len, &cap, ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true")) {
+    free(json);
     *err_out = chi_strdup("out of memory while building provider request");
     return NULL;
   }
 
-  if (chatgpt_mode) {
-    json = chi_format(
-        "{"
-        "\"model\":\"%s\","
-        "\"instructions\":\"%s\","
-        "\"input\":["
-        "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]},"
-        "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]}"
-        "],"
-        "\"reasoning\":{\"effort\":\"%s\"},"
-        "\"store\":false,"
-        "\"stream\":true"
-        "}",
-        emodel,
-        eins,
-        eins,
-        econv,
-        ereasoning);
-  } else {
-    json = chi_format(
-        "{"
-        "\"model\":\"%s\","
-        "\"input\":["
-        "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]},"
-        "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"%s\"}]}"
-        "],"
-        "\"reasoning\":{\"effort\":\"%s\"},"
-        "\"max_output_tokens\":900"
-        "}",
-        emodel,
-        eins,
-        econv,
-        ereasoning);
+  if (reasoning_effort != NULL) {
+    if (!chi_append(&json, &len, &cap, ",\"reasoning\":{\"effort\":") ||
+        !chi_append_json_quoted(&json, &len, &cap, reasoning_effort) ||
+        !chi_append(&json, &len, &cap, "}")) {
+      free(json);
+      *err_out = chi_strdup("out of memory while building provider request");
+      return NULL;
+    }
   }
 
-  free(emodel);
-  free(ereasoning);
-  free(eins);
-  free(econv);
-
-  if (json == NULL) {
+  if (!chi_append(&json, &len, &cap, ",\"store\":false,\"stream\":true}")) {
+    free(json);
     *err_out = chi_strdup("out of memory while building provider request");
+    return NULL;
   }
   return json;
 }
 
 static int chi_extract_provider_action(const char *response_body, chi_action *action, char **err_out) {
   char *payload = NULL;
+  char *tool_payload = NULL;
+  char *output_done_payload = NULL;
   char *output_text = NULL;
   char *status = NULL;
   char *reason = NULL;
+  char *call_id = NULL;
+  char *tool_name = NULL;
+  char *arguments_json = NULL;
+  double timeout = 0;
+  int has_tool = 0;
   int ok;
 
   *err_out = NULL;
+  memset(action, 0, sizeof(*action));
 
   payload = chi_extract_provider_payload(response_body);
   if (payload == NULL) {
@@ -1482,7 +1731,93 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
     return 0;
   }
 
+  tool_payload = chi_extract_sse_payload(response_body, "response.output_item.done");
+  if (tool_payload != NULL) {
+    has_tool = chi_extract_responses_function_call(tool_payload, &call_id, &tool_name, &arguments_json);
+  }
+  if (!has_tool) {
+    has_tool = chi_extract_responses_function_call(payload, &call_id, &tool_name, &arguments_json);
+  }
+
   output_text = chi_extract_responses_output_text(payload);
+  if (output_text == NULL) {
+    output_done_payload = chi_extract_sse_payload(response_body, "response.output_text.done");
+    if (output_done_payload != NULL) {
+      output_text = chi_json_get_string(output_done_payload, "text");
+    }
+  }
+  if (output_text == NULL) {
+    output_text = chi_extract_sse_output_text_deltas(response_body);
+  }
+
+  if (has_tool) {
+    action->assistant_text = output_text != NULL ? output_text : chi_strdup("");
+    output_text = NULL;
+    action->tool_call_id = call_id;
+    action->tool_name = tool_name;
+    action->tool_arguments_json = arguments_json;
+    call_id = NULL;
+    tool_name = NULL;
+    arguments_json = NULL;
+
+    if (action->assistant_text == NULL || action->tool_arguments_json == NULL) {
+      chi_action_reset(action);
+      *err_out = chi_strdup("out of memory while parsing tool call");
+      free(status);
+      free(reason);
+      free(payload);
+      free(tool_payload);
+      free(output_done_payload);
+      free(call_id);
+      free(tool_name);
+      free(arguments_json);
+      return 0;
+    }
+
+    if (chi_is_blank(action->tool_name)) {
+      free(action->tool_name);
+      action->tool_name = chi_strdup("bash");
+      if (action->tool_name == NULL) {
+        chi_action_reset(action);
+        *err_out = chi_strdup("out of memory while parsing tool call");
+        free(status);
+        free(reason);
+        free(payload);
+        free(tool_payload);
+        free(output_done_payload);
+        free(call_id);
+        free(tool_name);
+        free(arguments_json);
+        return 0;
+      }
+    }
+
+    action->tool_command = chi_json_get_string(action->tool_arguments_json, "command");
+    if (chi_json_get_number(action->tool_arguments_json, "timeout", &timeout) && timeout > 0) {
+      action->timeout_seconds = timeout;
+    }
+    if (chi_is_blank(action->tool_command)) {
+      free(action->tool_command);
+      action->tool_command = NULL;
+      action->final_text = chi_strdup("tool call missing command");
+      action->is_tool = 0;
+      ok = action->final_text != NULL;
+    } else {
+      action->is_tool = 1;
+      ok = 1;
+    }
+
+    free(status);
+    free(reason);
+    free(payload);
+    free(tool_payload);
+    free(output_done_payload);
+    free(call_id);
+    free(tool_name);
+    free(arguments_json);
+    return ok;
+  }
+
   if (output_text == NULL) {
     status = chi_json_get_string(payload, "status");
     reason = chi_extract_incomplete_reason(payload);
@@ -1502,6 +1837,11 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
     free(status);
     free(reason);
     free(payload);
+    free(tool_payload);
+    free(output_done_payload);
+    free(call_id);
+    free(tool_name);
+    free(arguments_json);
     if (*err_out == NULL) {
       *err_out = chi_format("could not parse output text from provider response: %s", response_body);
     }
@@ -1512,7 +1852,12 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
   free(reason);
   ok = chi_parse_action(output_text, action, err_out);
   free(payload);
+  free(tool_payload);
+  free(output_done_payload);
   free(output_text);
+  free(call_id);
+  free(tool_name);
+  free(arguments_json);
   return ok;
 }
 
@@ -1523,29 +1868,20 @@ static int chi_provider_request_with_auth(
     const char *url_env,
     const char *default_url,
     const char *http_label,
-    int chatgpt_mode,
     chi_action *action,
     char **err_out) {
   const char *url;
-  char *conv_text = NULL;
   char *req_json = NULL;
   char *resp_json = NULL;
   char *tmp_err = NULL;
   char *auth = NULL;
-  const char *headers[2];
+  const char *headers[3];
   int http_code = 0;
   int ok = 0;
 
   *err_out = NULL;
 
-  conv_text = chi_serialize_conversation(conversation);
-  if (conv_text == NULL) {
-    *err_out = chi_strdup("out of memory while serializing conversation");
-    return 0;
-  }
-
-  req_json = chi_build_request_json(cfg, conv_text, chatgpt_mode, &tmp_err);
-  free(conv_text);
+  req_json = chi_build_request_json(cfg, conversation, &tmp_err);
   if (req_json == NULL) {
     *err_out = tmp_err;
     return 0;
@@ -1560,12 +1896,13 @@ static int chi_provider_request_with_auth(
 
   headers[0] = auth;
   headers[1] = "Content-Type: application/json";
+  headers[2] = "Accept: text/event-stream";
   url = getenv(url_env);
   if (chi_is_blank(url)) {
     url = default_url;
   }
 
-  if (!chi_curl_request("POST", url, headers, 2, req_json, &resp_json, &http_code, &tmp_err)) {
+  if (!chi_curl_request("POST", url, headers, 3, req_json, &resp_json, &http_code, &tmp_err)) {
     *err_out = tmp_err;
     if (*err_out == NULL) {
       *err_out = chi_strdup("provider request failed");
@@ -1611,7 +1948,6 @@ static int chi_provider_openai(
       "OPENAI_API_URL",
       "https://api.openai.com/v1/responses",
       "openai",
-      0,
       action,
       err_out);
 }
@@ -1719,7 +2055,6 @@ static int chi_provider_chatgpt(
       "CHATGPT_API_URL",
       "https://chatgpt.com/backend-api/codex/responses",
       "chatgpt",
-      1,
       action,
       err_out);
   free(token);
@@ -1989,7 +2324,24 @@ int main(int argc, char **argv) {
         goto cleanup;
       }
 
-      if (!chi_conversation_add(&convo, "assistant", action.assistant_text, NULL, NULL, NULL)) {
+      if (action.is_tool && chi_is_blank(action.tool_call_id)) {
+        call_seq++;
+        action.tool_call_id = chi_format("call_%llu", call_seq);
+        if (action.tool_call_id == NULL) {
+          fprintf(stderr, "out of memory generating tool call id\n");
+          chi_action_reset(&action);
+          exit_code = 1;
+          goto cleanup;
+        }
+      }
+
+      if (!chi_conversation_add(
+              &convo,
+              "assistant",
+              action.assistant_text,
+              action.is_tool ? action.tool_call_id : NULL,
+              action.is_tool ? action.tool_name : NULL,
+              action.is_tool ? action.tool_arguments_json : NULL)) {
         fprintf(stderr, "failed to append assistant message\n");
         chi_action_reset(&action);
         exit_code = 1;
@@ -2005,40 +2357,30 @@ int main(int argc, char **argv) {
 
       {
         char *call_id = NULL;
-        char *args_json = NULL;
-        char *escaped_command = NULL;
         char *tool_output = NULL;
         char *tool_error = NULL;
         char *tool_record = NULL;
         int is_error = 0;
         int tool_step_ok = 0;
         double timeout = action.timeout_seconds > 0 ? action.timeout_seconds : 0;
+        const char *tool_name = chi_is_blank(action.tool_name) ? "bash" : action.tool_name;
 
-        call_seq++;
-        call_id = chi_format("call_%llu", call_seq);
+        call_id = chi_strdup(action.tool_call_id);
         if (call_id == NULL) {
-          fprintf(stderr, "out of memory generating tool call id\n");
+          fprintf(stderr, "out of memory preparing tool call id\n");
           goto tool_cleanup;
         }
 
-        printf("[tool start] %s (%s)\n", action.tool_name, call_id);
+        printf("[tool start] %s (%s)\n", tool_name, call_id);
+        printf("[tool command]\n%s\n", action.tool_command == NULL ? "" : action.tool_command);
         if (!chi_run_bash(cfg.working_dir, action.tool_command, timeout, &tool_output, &is_error, &tool_error)) {
           fprintf(stderr, "failed to run tool\n");
           goto tool_cleanup;
         }
 
-        printf("[tool done] %s (%s) error=%d\n", action.tool_name, call_id, is_error);
+        printf("[tool done] %s (%s) error=%d\n", tool_name, call_id, is_error);
         if (!chi_is_blank(tool_output)) {
           printf("%s\n", tool_output);
-        }
-
-        escaped_command = chi_json_escape(action.tool_command);
-        if (escaped_command != NULL) {
-          if (timeout > 0) {
-            args_json = chi_format("{\"command\":\"%s\",\"timeout\":%.3f}", escaped_command, timeout);
-          } else {
-            args_json = chi_format("{\"command\":\"%s\"}", escaped_command);
-          }
         }
 
         if (tool_error != NULL) {
@@ -2053,8 +2395,8 @@ int main(int argc, char **argv) {
                 "toolResult",
                 tool_record,
                 call_id,
-                action.tool_name,
-                args_json == NULL ? "{}" : args_json)) {
+                NULL,
+                NULL)) {
           fprintf(stderr, "failed to append tool result\n");
           goto tool_cleanup;
         }
@@ -2070,8 +2412,6 @@ int main(int argc, char **argv) {
 
       tool_cleanup:
         free(call_id);
-        free(args_json);
-        free(escaped_command);
         free(tool_output);
         free(tool_error);
         free(tool_record);
