@@ -68,11 +68,11 @@ typedef struct {
   chi_backend backend;
   const char *model;
   const char *reasoning_effort;
-  const char *instructions_file;
+  const char *system_prompt_file;
   const char *working_dir;
   int debug;
   char session_id[CHI_SESSION_ID_MAX];
-  char *instructions_text;
+  char *system_prompt_text;
   char *chatgpt_access_token;
 } chi_config;
 
@@ -225,13 +225,13 @@ static char *chi_read_text_file(const char *path, char **err_out) {
   *err_out = NULL;
 
   if (chi_is_blank(path)) {
-    *err_out = chi_strdup("instructions file path is blank");
+    *err_out = chi_strdup("system prompt file path is blank");
     return NULL;
   }
 
   fp = fopen(path, "rb");
   if (fp == NULL) {
-    *err_out = chi_format("failed to open instructions file '%s': %s", path, strerror(errno));
+    *err_out = chi_format("failed to open system prompt file '%s': %s", path, strerror(errno));
     return NULL;
   }
 
@@ -239,7 +239,7 @@ static char *chi_read_text_file(const char *path, char **err_out) {
     if (!chi_append_n(&buf, &len, &cap, chunk, n)) {
       free(buf);
       fclose(fp);
-      *err_out = chi_strdup("out of memory while loading instructions file");
+      *err_out = chi_strdup("out of memory while loading system prompt file");
       return NULL;
     }
   }
@@ -247,19 +247,19 @@ static char *chi_read_text_file(const char *path, char **err_out) {
   if (ferror(fp)) {
     free(buf);
     fclose(fp);
-    *err_out = chi_format("failed to read instructions file '%s': %s", path, strerror(errno));
+    *err_out = chi_format("failed to read system prompt file '%s': %s", path, strerror(errno));
     return NULL;
   }
 
   if (fclose(fp) != 0) {
     free(buf);
-    *err_out = chi_format("failed to close instructions file '%s': %s", path, strerror(errno));
+    *err_out = chi_format("failed to close system prompt file '%s': %s", path, strerror(errno));
     return NULL;
   }
 
   if (chi_is_blank(buf)) {
     free(buf);
-    *err_out = chi_format("instructions file '%s' is empty", path);
+    *err_out = chi_format("system prompt file '%s' is empty", path);
     return NULL;
   }
 
@@ -1896,10 +1896,10 @@ static int chi_append_responses_input(
 }
 
 static char *chi_build_request_json(const chi_config *cfg, const chi_conversation *conversation, char **err_out) {
-  const char *default_instructions =
+  const char *default_system_prompt =
       "You are a coding agent controller with one tool: bash. "
       "Use bash to create/edit/run files. Use uv run for python.";
-  const char *instructions = chi_is_blank(cfg->instructions_text) ? default_instructions : cfg->instructions_text;
+  const char *system_prompt = chi_is_blank(cfg->system_prompt_text) ? default_system_prompt : cfg->system_prompt_text;
   const char *reasoning_effort = chi_normalize_reasoning_effort(cfg->reasoning_effort);
   const char *bash_tool_json =
       "{\"type\":\"function\","
@@ -1924,7 +1924,7 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
       !chi_append(&json, &len, &cap, "\"model\":") ||
       !chi_append_json_quoted(&json, &len, &cap, cfg->model) ||
       !chi_append(&json, &len, &cap, ",") ||
-      !chi_append_responses_input(conversation, instructions, &json, &len, &cap) ||
+      !chi_append_responses_input(conversation, system_prompt, &json, &len, &cap) ||
       !chi_append(&json, &len, &cap, ",\"tools\":[") ||
       !chi_append(&json, &len, &cap, bash_tool_json) ||
       !chi_append(&json, &len, &cap, "]") ||
@@ -2416,7 +2416,7 @@ static int chi_parse_backend(const char *value, chi_backend *out) {
 
 static void chi_usage(const char *argv0) {
   fprintf(stderr,
-          "usage: %s [--backend openai|chatgpt] [--model MODEL] [--reasoning EFFORT] [--instructions-file PATH] [--queue \"prompt\"] \"prompt\" [working_dir]\n"
+          "usage: %s [--backend openai|chatgpt] [--model MODEL] [--reasoning EFFORT] [--system-prompt-file PATH] [--queue \"prompt\"] \"prompt\" [working_dir]\n"
           "example: %s \"Use bash to create hello.py and run it with uv run hello.py\" ./agent_playground\n"
           "\n"
           "env:\n"
@@ -2424,7 +2424,7 @@ static void chi_usage(const char *argv0) {
           "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend\n"
           "  CHATGPT_SESSION_TOKEN        alternate auth for chatgpt backend\n"
           "  CHI_BACKEND                  default backend (openai|chatgpt)\n"
-          "  CHI_INSTRUCTIONS_FILE        path to custom instructions text file\n"
+          "  CHI_SYSTEM_PROMPT_FILE       path to custom system prompt text file\n"
           "  CHI_HTTP_CONNECT_TIMEOUT     curl connect timeout seconds (default: 5)\n"
           "  CHI_HTTP_MAX_TIME            curl total timeout seconds (default: 120)\n"
           "  CHI_DEBUG                    set to non-zero for debug logs\n",
@@ -2486,9 +2486,9 @@ int main(int argc, char **argv) {
   if (chi_is_blank(cfg.reasoning_effort)) {
     cfg.reasoning_effort = "high";
   }
-  cfg.instructions_file = getenv("CHI_INSTRUCTIONS_FILE");
-  if (chi_is_blank(cfg.instructions_file)) {
-    cfg.instructions_file = NULL;
+  cfg.system_prompt_file = getenv("CHI_SYSTEM_PROMPT_FILE");
+  if (chi_is_blank(cfg.system_prompt_file)) {
+    cfg.system_prompt_file = NULL;
   }
   cfg.debug = !chi_is_blank(getenv("CHI_DEBUG")) && strcmp(getenv("CHI_DEBUG"), "0") != 0;
 
@@ -2523,11 +2523,11 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    if (strcmp(argv[i], "--instructions-file") == 0) {
+    if (strcmp(argv[i], "--system-prompt-file") == 0) {
       if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
-        return chi_arg_fail(&queue, "missing --instructions-file value");
+        return chi_arg_fail(&queue, "missing --system-prompt-file value");
       }
-      cfg.instructions_file = argv[++i];
+      cfg.system_prompt_file = argv[++i];
       continue;
     }
 
@@ -2568,11 +2568,11 @@ int main(int argc, char **argv) {
     return chi_arg_usage_fail(&queue, argv[0]);
   }
 
-  if (!chi_is_blank(cfg.instructions_file)) {
+  if (!chi_is_blank(cfg.system_prompt_file)) {
     char *load_err = NULL;
-    cfg.instructions_text = chi_read_text_file(cfg.instructions_file, &load_err);
-    if (cfg.instructions_text == NULL) {
-      fprintf(stderr, "%s\n", load_err == NULL ? "failed to load instructions file" : load_err);
+    cfg.system_prompt_text = chi_read_text_file(cfg.system_prompt_file, &load_err);
+    if (cfg.system_prompt_text == NULL) {
+      fprintf(stderr, "%s\n", load_err == NULL ? "failed to load system prompt file" : load_err);
       free(load_err);
       chi_prompt_queue_destroy(&queue);
       return 2;
@@ -2727,7 +2727,7 @@ int main(int argc, char **argv) {
 cleanup:
   chi_prompt_queue_destroy(&queue);
   chi_conversation_destroy(&convo);
-  free(cfg.instructions_text);
+  free(cfg.system_prompt_text);
   free(cfg.chatgpt_access_token);
   return exit_code;
 }
