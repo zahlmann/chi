@@ -68,9 +68,11 @@ typedef struct {
   chi_backend backend;
   const char *model;
   const char *reasoning_effort;
+  const char *instructions_file;
   const char *working_dir;
   int debug;
   char session_id[CHI_SESSION_ID_MAX];
+  char *instructions_text;
   char *chatgpt_access_token;
 } chi_config;
 
@@ -210,6 +212,58 @@ static int chi_append(char **buf, size_t *len, size_t *cap, const char *text) {
     text = "";
   }
   return chi_append_n(buf, len, cap, text, strlen(text));
+}
+
+static char *chi_read_text_file(const char *path, char **err_out) {
+  FILE *fp;
+  char chunk[4096];
+  size_t n;
+  char *buf = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  *err_out = NULL;
+
+  if (chi_is_blank(path)) {
+    *err_out = chi_strdup("instructions file path is blank");
+    return NULL;
+  }
+
+  fp = fopen(path, "rb");
+  if (fp == NULL) {
+    *err_out = chi_format("failed to open instructions file '%s': %s", path, strerror(errno));
+    return NULL;
+  }
+
+  while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+    if (!chi_append_n(&buf, &len, &cap, chunk, n)) {
+      free(buf);
+      fclose(fp);
+      *err_out = chi_strdup("out of memory while loading instructions file");
+      return NULL;
+    }
+  }
+
+  if (ferror(fp)) {
+    free(buf);
+    fclose(fp);
+    *err_out = chi_format("failed to read instructions file '%s': %s", path, strerror(errno));
+    return NULL;
+  }
+
+  if (fclose(fp) != 0) {
+    free(buf);
+    *err_out = chi_format("failed to close instructions file '%s': %s", path, strerror(errno));
+    return NULL;
+  }
+
+  if (chi_is_blank(buf)) {
+    free(buf);
+    *err_out = chi_format("instructions file '%s' is empty", path);
+    return NULL;
+  }
+
+  return buf;
 }
 
 static long long chi_now_ms(void) {
@@ -1708,6 +1762,24 @@ static int chi_append_responses_user_message(
   return 1;
 }
 
+static int chi_append_responses_system_message(
+    const char *text,
+    char **buf,
+    size_t *len,
+    size_t *cap,
+    int *first_item) {
+  if (chi_is_blank(text)) {
+    return 1;
+  }
+  if (!chi_append_input_item_start(buf, len, cap, first_item) ||
+      !chi_append(buf, len, cap, "{\"type\":\"message\",\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":") ||
+      !chi_append_json_quoted(buf, len, cap, text) ||
+      !chi_append(buf, len, cap, "}]}")) {
+    return 0;
+  }
+  return 1;
+}
+
 static int chi_append_responses_assistant_message(
     const chi_message *m,
     size_t index,
@@ -1780,6 +1852,7 @@ static int chi_append_responses_tool_result(
 
 static int chi_append_responses_input(
     const chi_conversation *conversation,
+    const char *system_text,
     char **buf,
     size_t *len,
     size_t *cap) {
@@ -1787,6 +1860,10 @@ static int chi_append_responses_input(
   int first_item = 1;
 
   if (!chi_append(buf, len, cap, "\"input\":[")) {
+    return 0;
+  }
+
+  if (!chi_append_responses_system_message(system_text, buf, len, cap, &first_item)) {
     return 0;
   }
 
@@ -1819,9 +1896,10 @@ static int chi_append_responses_input(
 }
 
 static char *chi_build_request_json(const chi_config *cfg, const chi_conversation *conversation, char **err_out) {
-  const char *instructions =
+  const char *default_instructions =
       "You are a coding agent controller with one tool: bash. "
       "Use bash to create/edit/run files. Use uv run for python.";
+  const char *instructions = chi_is_blank(cfg->instructions_text) ? default_instructions : cfg->instructions_text;
   const char *reasoning_effort = chi_normalize_reasoning_effort(cfg->reasoning_effort);
   const char *bash_tool_json =
       "{\"type\":\"function\","
@@ -1845,10 +1923,8 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
   if (!chi_append(&json, &len, &cap, "{") ||
       !chi_append(&json, &len, &cap, "\"model\":") ||
       !chi_append_json_quoted(&json, &len, &cap, cfg->model) ||
-      !chi_append(&json, &len, &cap, ",\"instructions\":") ||
-      !chi_append_json_quoted(&json, &len, &cap, instructions) ||
       !chi_append(&json, &len, &cap, ",") ||
-      !chi_append_responses_input(conversation, &json, &len, &cap) ||
+      !chi_append_responses_input(conversation, instructions, &json, &len, &cap) ||
       !chi_append(&json, &len, &cap, ",\"tools\":[") ||
       !chi_append(&json, &len, &cap, bash_tool_json) ||
       !chi_append(&json, &len, &cap, "]") ||
@@ -2340,7 +2416,7 @@ static int chi_parse_backend(const char *value, chi_backend *out) {
 
 static void chi_usage(const char *argv0) {
   fprintf(stderr,
-          "usage: %s [--backend openai|chatgpt] [--model MODEL] [--reasoning EFFORT] [--queue \"prompt\"] \"prompt\" [working_dir]\n"
+          "usage: %s [--backend openai|chatgpt] [--model MODEL] [--reasoning EFFORT] [--instructions-file PATH] [--queue \"prompt\"] \"prompt\" [working_dir]\n"
           "example: %s \"Use bash to create hello.py and run it with uv run hello.py\" ./agent_playground\n"
           "\n"
           "env:\n"
@@ -2348,6 +2424,7 @@ static void chi_usage(const char *argv0) {
           "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend\n"
           "  CHATGPT_SESSION_TOKEN        alternate auth for chatgpt backend\n"
           "  CHI_BACKEND                  default backend (openai|chatgpt)\n"
+          "  CHI_INSTRUCTIONS_FILE        path to custom instructions text file\n"
           "  CHI_HTTP_CONNECT_TIMEOUT     curl connect timeout seconds (default: 5)\n"
           "  CHI_HTTP_MAX_TIME            curl total timeout seconds (default: 120)\n"
           "  CHI_DEBUG                    set to non-zero for debug logs\n",
@@ -2409,6 +2486,10 @@ int main(int argc, char **argv) {
   if (chi_is_blank(cfg.reasoning_effort)) {
     cfg.reasoning_effort = "high";
   }
+  cfg.instructions_file = getenv("CHI_INSTRUCTIONS_FILE");
+  if (chi_is_blank(cfg.instructions_file)) {
+    cfg.instructions_file = NULL;
+  }
   cfg.debug = !chi_is_blank(getenv("CHI_DEBUG")) && strcmp(getenv("CHI_DEBUG"), "0") != 0;
 
   for (i = 1; i < argc; i++) {
@@ -2439,6 +2520,14 @@ int main(int argc, char **argv) {
         return chi_arg_fail(&queue, "missing --reasoning value");
       }
       cfg.reasoning_effort = argv[++i];
+      continue;
+    }
+
+    if (strcmp(argv[i], "--instructions-file") == 0) {
+      if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
+        return chi_arg_fail(&queue, "missing --instructions-file value");
+      }
+      cfg.instructions_file = argv[++i];
       continue;
     }
 
@@ -2477,6 +2566,17 @@ int main(int argc, char **argv) {
 
   if (chi_is_blank(prompt)) {
     return chi_arg_usage_fail(&queue, argv[0]);
+  }
+
+  if (!chi_is_blank(cfg.instructions_file)) {
+    char *load_err = NULL;
+    cfg.instructions_text = chi_read_text_file(cfg.instructions_file, &load_err);
+    if (cfg.instructions_text == NULL) {
+      fprintf(stderr, "%s\n", load_err == NULL ? "failed to load instructions file" : load_err);
+      free(load_err);
+      chi_prompt_queue_destroy(&queue);
+      return 2;
+    }
   }
 
   if (!chi_prompt_queue_push_front(&queue, prompt)) {
@@ -2627,6 +2727,7 @@ int main(int argc, char **argv) {
 cleanup:
   chi_prompt_queue_destroy(&queue);
   chi_conversation_destroy(&convo);
+  free(cfg.instructions_text);
   free(cfg.chatgpt_access_token);
   return exit_code;
 }
