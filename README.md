@@ -25,6 +25,14 @@ OPENAI_API_KEY=$OPENAI_API_KEY ./chi \
   ./agent_playground
 ```
 
+Use `--instructions-file` (or `CHI_INSTRUCTIONS_FILE`) to load a custom system prompt from a file. `chi` injects it as a literal `system` message in the request `input`:
+
+```bash
+./chi --instructions-file prompts/system/codex-lite-ed.txt \
+  "Edit hello.py to print hi and run it" \
+  ./agent_playground
+```
+
 `chi` uses `OPENAI_API_KEY` from your shell env and requires `curl`.
 It forces `curl` retries off (`--retry 0`) and ignores user/global curl configs (`-q`)
 so provider failures fail fast instead of looping.
@@ -34,6 +42,7 @@ so provider failures fail fast instead of looping.
 - `openai` backend (default): set `OPENAI_API_KEY`
 - `chatgpt` backend: set `CHATGPT_ACCESS_TOKEN` or `CHATGPT_SESSION_TOKEN`
 - optional network tuning:
+  - `CHI_INSTRUCTIONS_FILE` (custom instructions text file)
   - `CHI_HTTP_CONNECT_TIMEOUT` (default `5`)
   - `CHI_HTTP_MAX_TIME` (default `120`)
 
