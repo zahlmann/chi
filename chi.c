@@ -19,7 +19,7 @@
 #define CHI_MAX_OUTPUT_BYTES (24 * 1024)
 #define CHI_SESSION_ID_MAX 64
 #define CHI_HTTP_CONNECT_TIMEOUT_DEFAULT 5
-#define CHI_HTTP_MAX_TIME_DEFAULT 45
+#define CHI_HTTP_MAX_TIME_DEFAULT 120
 
 typedef enum {
   CHI_BACKEND_OPENAI = 0,
@@ -2161,7 +2161,7 @@ static void chi_usage(const char *argv0) {
           "  CHATGPT_SESSION_TOKEN        alternate auth for chatgpt backend\n"
           "  CHI_BACKEND                  default backend (openai|chatgpt)\n"
           "  CHI_HTTP_CONNECT_TIMEOUT     curl connect timeout seconds (default: 5)\n"
-          "  CHI_HTTP_MAX_TIME            curl total timeout seconds (default: 45)\n"
+          "  CHI_HTTP_MAX_TIME            curl total timeout seconds (default: 120)\n"
           "  CHI_DEBUG                    set to non-zero for debug logs\n",
           argv0,
           argv0);

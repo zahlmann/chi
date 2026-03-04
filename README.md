@@ -34,7 +34,7 @@ so provider failures fail fast instead of looping.
 - `chatgpt` backend: set `CHATGPT_ACCESS_TOKEN` or `CHATGPT_SESSION_TOKEN`
 - optional network tuning:
   - `CHI_HTTP_CONNECT_TIMEOUT` (default `5`)
-  - `CHI_HTTP_MAX_TIME` (default `45`)
+  - `CHI_HTTP_MAX_TIME` (default `120`)
 
 Example:
 
