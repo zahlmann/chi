@@ -22,7 +22,7 @@ cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_p
 ```bash
 OPENAI_API_KEY=$OPENAI_API_KEY ./chi \
   "Use bash to create hello.py and run it with uv run hello.py" \
-  ./agent_playground
+  .
 ```
 
 Use `--system-prompt-file` (or `CHI_SYSTEM_PROMPT_FILE`) to load a custom system prompt from a file. `chi` injects it as a literal `system` message in the request `input`:
@@ -30,7 +30,7 @@ Use `--system-prompt-file` (or `CHI_SYSTEM_PROMPT_FILE`) to load a custom system
 ```bash
 ./chi --system-prompt-file prompts/system/codex-lite-ed.txt \
   "Edit hello.py to print hi and run it" \
-  ./agent_playground
+  .
 ```
 
 `chi` uses `OPENAI_API_KEY` from your shell env and requires `curl`.

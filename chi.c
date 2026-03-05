@@ -2540,7 +2540,7 @@ static int chi_parse_backend(const char *value, chi_backend *out) {
 static void chi_usage(const char *argv0) {
   fprintf(stderr,
           "usage: %s [--backend openai|chatgpt] [--model MODEL] [--reasoning EFFORT] [--system-prompt-file PATH] [--queue \"prompt\"] \"prompt\" [working_dir]\n"
-          "example: %s \"Edit hello.py to print hi and run it\" ./agent_playground\n"
+          "example: %s \"Edit hello.py to print hi and run it\" .\n"
           "\n"
           "env:\n"
           "  OPENAI_API_KEY               auth for openai backend\n"
