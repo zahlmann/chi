@@ -3,9 +3,9 @@
 `chi` is a compact, dependency-free C coding-agent CLI runtime:
 
 - queued user messages
-- tool-call loop (`assistant -> bash -> assistant`)
+- tool-call loop (`assistant -> tool -> assistant`)
 - switchable backends (`openai`, `chatgpt`)
-- built-in `bash` tool
+- built-in `bash` + freeform `apply_patch` tools
 - optional model reasoning summaries printed as `[thinking]` (when provided by the API)
 
 It is intentionally small.
@@ -14,7 +14,7 @@ It is intentionally small.
 
 ```bash
 cd chi
-cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c -o chi
+cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_patch.c -o chi
 ```
 
 ## Run Live Agent
