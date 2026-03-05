@@ -21,6 +21,7 @@ cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_p
 
 ```bash
 OPENAI_API_KEY=$OPENAI_API_KEY ./chi \
+  --model gpt-5.2-codex \
   "Use bash to create hello.py and run it with uv run hello.py" \
   .
 ```
@@ -42,6 +43,8 @@ so provider failures fail fast instead of looping.
 - `openai` backend (default): set `OPENAI_API_KEY`
 - `chatgpt` backend: set `CHATGPT_ACCESS_TOKEN` or `CHATGPT_SESSION_TOKEN`
 - optional network tuning:
+  - `CHI_MODEL` (same as passing `--model`, default `gpt-5.2-codex`)
+  - `CHI_REASONING_EFFORT` (same as passing `--reasoning`, default `high`)
   - `CHI_SYSTEM_PROMPT_FILE` (custom system prompt text file)
   - `CHI_HTTP_CONNECT_TIMEOUT` (default `5`)
   - `CHI_HTTP_MAX_TIME` (default `120`)

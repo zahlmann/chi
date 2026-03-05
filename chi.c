@@ -2547,6 +2547,8 @@ static void chi_usage(const char *argv0) {
           "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend\n"
           "  CHATGPT_SESSION_TOKEN        alternate auth for chatgpt backend\n"
           "  CHI_BACKEND                  default backend (openai|chatgpt)\n"
+          "  CHI_MODEL                    default model (default: gpt-5.2-codex)\n"
+          "  CHI_REASONING_EFFORT         default reasoning effort (default: high)\n"
           "  CHI_SYSTEM_PROMPT_FILE       path to custom system prompt text file\n"
           "  CHI_HTTP_CONNECT_TIMEOUT     curl connect timeout seconds (default: 5)\n"
           "  CHI_HTTP_MAX_TIME            curl total timeout seconds (default: 120)\n"
