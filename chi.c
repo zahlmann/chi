@@ -2017,6 +2017,14 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
     }
   }
 
+  if (cfg->backend == CHI_BACKEND_CHATGPT) {
+    if (!chi_append(&json, &len, &cap, ",\"instructions\":\"\"")) {
+      free(json);
+      *err_out = chi_strdup("out of memory while building provider request");
+      return NULL;
+    }
+  }
+
   if (!chi_append(&json, &len, &cap, ",\"store\":false,\"stream\":true}")) {
     free(json);
     *err_out = chi_strdup("out of memory while building provider request");
