@@ -2875,12 +2875,12 @@ static int chi_run_apply_patch_tool(
 }
 
 static int chi_parse_backend(const char *value, chi_backend *out) {
-  if (value == NULL || strcmp(value, "openai") == 0 || strcmp(value, "openai_api") == 0) {
-    *out = CHI_BACKEND_OPENAI;
+  if (value == NULL || strcmp(value, "chatgpt") == 0) {
+    *out = CHI_BACKEND_CHATGPT;
     return 1;
   }
-  if (strcmp(value, "chatgpt") == 0) {
-    *out = CHI_BACKEND_CHATGPT;
+  if (strcmp(value, "openai") == 0 || strcmp(value, "openai_api") == 0) {
+    *out = CHI_BACKEND_OPENAI;
     return 1;
   }
   return 0;
@@ -2893,9 +2893,9 @@ static void chi_usage(const char *argv0) {
           "resume:  %s --session session-abc123 \"continue\" .\n"
           "\n"
           "env:\n"
-          "  OPENAI_API_KEY               auth for openai backend\n"
-          "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend (else ~/.codex/auth.json)\n"
-          "  CHI_BACKEND                  default backend (openai|chatgpt)\n"
+          "  OPENAI_API_KEY               auth for openai backend when selected\n"
+          "  CHATGPT_ACCESS_TOKEN         direct auth for default chatgpt backend (else ~/.codex/auth.json)\n"
+          "  CHI_BACKEND                  backend override (default: chatgpt; openai|chatgpt)\n"
           "  CHI_MODEL                    default model (default: gpt-5.2-codex)\n"
           "  CHI_REASONING_EFFORT         default reasoning effort (default: high)\n"
           "  CHI_SESSION_DIR              session state dir (default: .chi-sessions)\n"

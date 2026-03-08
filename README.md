@@ -21,7 +21,7 @@ cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_p
 ## Run Live Agent
 
 ```bash
-OPENAI_API_KEY=$OPENAI_API_KEY ./chi \
+./chi \
   --model gpt-5.2-codex \
   "Use bash to create hello.py and run it with uv run hello.py" \
   .
@@ -35,7 +35,7 @@ Use `--system-prompt-file` (or `CHI_SYSTEM_PROMPT_FILE`) to load a custom system
   .
 ```
 
-`chi` uses `OPENAI_API_KEY` from your shell env and requires `libcurl` at build/runtime.
+By default `chi` uses the `chatgpt` backend and will read `CHATGPT_ACCESS_TOKEN` or fall back to `~/.codex/auth.json` `tokens.access_token`. Use `CHI_BACKEND=openai` or `--backend openai` when you want the OpenAI API path with `OPENAI_API_KEY`. `chi` requires `libcurl` at build/runtime.
 
 Every completed model response now prints the session id after `[final]`.
 `chi` stores session state in `.chi-sessions/` by default, or `CHI_SESSION_DIR` if set.
@@ -59,8 +59,8 @@ You can combine that with the existing queueing support:
 
 ## Backends And Auth
 
-- `openai` backend (default): set `OPENAI_API_KEY`
-- `chatgpt` backend: uses `CHATGPT_ACCESS_TOKEN` when set, otherwise falls back to `~/.codex/auth.json` `tokens.access_token`
+- `chatgpt` backend (default): uses `CHATGPT_ACCESS_TOKEN` when set, otherwise falls back to `~/.codex/auth.json` `tokens.access_token`
+- `openai` backend: set `OPENAI_API_KEY` and pass `--backend openai` or `CHI_BACKEND=openai`
 - optional network tuning:
   - `CHI_MODEL` (same as passing `--model`, default `gpt-5.2-codex`)
   - `CHI_REASONING_EFFORT` (same as passing `--reasoning`, default `high`)
@@ -72,5 +72,11 @@ You can combine that with the existing queueing support:
 Example:
 
 ```bash
-CHI_BACKEND=chatgpt ./chi "List files" .
+./chi "List files" .
+```
+
+OpenAI example:
+
+```bash
+CHI_BACKEND=openai OPENAI_API_KEY=$OPENAI_API_KEY ./chi "List files" .
 ```
