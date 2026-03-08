@@ -3,6 +3,7 @@
 `chi` is a compact, dependency-free C coding-agent CLI runtime:
 
 - queued user messages
+- resumable sessions via `--session`
 - tool-call loop (`assistant -> tool -> assistant`)
 - switchable backends (`openai`, `chatgpt`)
 - built-in `bash` + freeform `apply_patch` tools
@@ -38,6 +39,26 @@ Use `--system-prompt-file` (or `CHI_SYSTEM_PROMPT_FILE`) to load a custom system
 It forces `curl` retries off (`--retry 0`) and ignores user/global curl configs (`-q`)
 so provider failures fail fast instead of looping.
 
+Every completed model response now prints the session id after `[final]`.
+`chi` stores session state in `.chi-sessions/` by default, or `CHI_SESSION_DIR` if set.
+
+Resume an existing thread by passing the session id back in:
+
+```bash
+./chi --session session-abc123 \
+  "Continue and add tests for the change" \
+  .
+```
+
+You can combine that with the existing queueing support:
+
+```bash
+./chi --session session-abc123 \
+  --queue "Then summarize what changed" \
+  "Fix the failing test first" \
+  .
+```
+
 ## Backends And Auth
 
 - `openai` backend (default): set `OPENAI_API_KEY`
@@ -45,6 +66,7 @@ so provider failures fail fast instead of looping.
 - optional network tuning:
   - `CHI_MODEL` (same as passing `--model`, default `gpt-5.2-codex`)
   - `CHI_REASONING_EFFORT` (same as passing `--reasoning`, default `high`)
+  - `CHI_SESSION_DIR` (session state dir, default `.chi-sessions`)
   - `CHI_SYSTEM_PROMPT_FILE` (custom system prompt text file)
   - `CHI_HTTP_CONNECT_TIMEOUT` (default `5`)
   - `CHI_HTTP_MAX_TIME` (default `120`)
