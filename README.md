@@ -1,6 +1,6 @@
 # chi
 
-`chi` is a compact, dependency-free C coding-agent CLI runtime:
+`chi` is a compact C coding-agent CLI runtime:
 
 - queued user messages
 - resumable sessions via `--session`
@@ -15,7 +15,7 @@ It is intentionally small.
 
 ```bash
 cd chi
-cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_patch.c -o chi
+cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_patch.c -lcurl -o chi
 ```
 
 ## Run Live Agent
@@ -35,9 +35,7 @@ Use `--system-prompt-file` (or `CHI_SYSTEM_PROMPT_FILE`) to load a custom system
   .
 ```
 
-`chi` uses `OPENAI_API_KEY` from your shell env and requires `curl`.
-It forces `curl` retries off (`--retry 0`) and ignores user/global curl configs (`-q`)
-so provider failures fail fast instead of looping.
+`chi` uses `OPENAI_API_KEY` from your shell env and requires `libcurl` at build/runtime.
 
 Every completed model response now prints the session id after `[final]`.
 `chi` stores session state in `.chi-sessions/` by default, or `CHI_SESSION_DIR` if set.
