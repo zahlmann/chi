@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <curl/curl.h>
+
 #include "apply_patch.h"
 
 #define CHI_MAX_TURNS 256
@@ -767,73 +769,6 @@ static char *chi_truncate_tail(const char *text, int max_lines, size_t max_bytes
   return out;
 }
 
-static int chi_write_file(const char *path, const char *content) {
-  FILE *f;
-  size_t n;
-
-  f = fopen(path, "wb");
-  if (f == NULL) {
-    return 0;
-  }
-
-  if (content == NULL) {
-    content = "";
-  }
-
-  n = strlen(content);
-  if (n > 0 && fwrite(content, 1, n, f) != n) {
-    fclose(f);
-    return 0;
-  }
-
-  fclose(f);
-  return 1;
-}
-
-static char *chi_read_file(const char *path) {
-  FILE *f;
-  long size;
-  size_t got;
-  char *buf;
-
-  f = fopen(path, "rb");
-  if (f == NULL) {
-    return NULL;
-  }
-
-  if (fseek(f, 0, SEEK_END) != 0) {
-    fclose(f);
-    return NULL;
-  }
-
-  size = ftell(f);
-  if (size < 0) {
-    fclose(f);
-    return NULL;
-  }
-
-  if (fseek(f, 0, SEEK_SET) != 0) {
-    fclose(f);
-    return NULL;
-  }
-
-  buf = (char *)malloc((size_t)size + 1);
-  if (buf == NULL) {
-    fclose(f);
-    return NULL;
-  }
-
-  got = fread(buf, 1, (size_t)size, f);
-  fclose(f);
-  if (got != (size_t)size) {
-    free(buf);
-    return NULL;
-  }
-
-  buf[size] = '\0';
-  return buf;
-}
-
 static void chi_trim_trailing_newlines(char *text) {
   size_t len;
 
@@ -1271,89 +1206,25 @@ static unsigned long long chi_conversation_max_generated_call_seq(const chi_conv
   return max_value;
 }
 
-static char *chi_shell_quote(const char *text) {
-  size_t i;
-  size_t len = 2;
-  size_t out_i = 0;
-  char *out;
+typedef struct {
+  char *data;
+  size_t len;
+  size_t cap;
+} chi_http_buffer;
 
-  if (text == NULL) {
-    text = "";
-  }
+static size_t chi_curl_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+  size_t total = size * nmemb;
+  chi_http_buffer *buffer = (chi_http_buffer *)userdata;
 
-  for (i = 0; text[i] != '\0'; i++) {
-    len += (text[i] == '\'') ? 4 : 1;
-  }
-
-  out = (char *)malloc(len + 1);
-  if (out == NULL) {
-    return NULL;
-  }
-
-  out[out_i++] = '\'';
-  for (i = 0; text[i] != '\0'; i++) {
-    if (text[i] == '\'') {
-      memcpy(out + out_i, "'\\''", 4);
-      out_i += 4;
-      continue;
-    }
-    out[out_i++] = text[i];
-  }
-  out[out_i++] = '\'';
-  out[out_i] = '\0';
-  return out;
-}
-
-static int chi_cmd_append_checked(
-    char **cmd,
-    size_t *cmd_len,
-    size_t *cmd_cap,
-    const char *text,
-    const char **fail_msg) {
-  if (!chi_append(cmd, cmd_len, cmd_cap, text)) {
-    *fail_msg = "out of memory building curl command";
-    return 0;
-  }
-  return 1;
-}
-
-static int chi_cmd_append_quoted(
-    char **cmd,
-    size_t *cmd_len,
-    size_t *cmd_cap,
-    const char *prefix,
-    const char *raw_value,
-    const char **fail_msg) {
-  char *quoted;
-  int ok;
-
-  quoted = chi_shell_quote(raw_value);
-  if (quoted == NULL) {
-    *fail_msg = "out of memory building curl command";
+  if (total == 0) {
     return 0;
   }
 
-  ok = 1;
-  if (prefix != NULL && !chi_cmd_append_checked(cmd, cmd_len, cmd_cap, prefix, fail_msg)) {
-    ok = 0;
-  }
-  if (ok && !chi_cmd_append_checked(cmd, cmd_len, cmd_cap, quoted, fail_msg)) {
-    ok = 0;
-  }
-
-  free(quoted);
-  return ok;
-}
-
-static int chi_prepare_temp_file(char path_template[], int *fd, int *created) {
-  *fd = mkstemp(path_template);
-  if (*fd < 0) {
+  if (!chi_append_n(&buffer->data, &buffer->len, &buffer->cap, (const char *)ptr, total)) {
     return 0;
   }
-  *created = 1;
-  close(*fd);
-  *fd = -1;
-  return 1;
+
+  return total;
 }
 
 static int chi_curl_request(
@@ -1365,32 +1236,28 @@ static int chi_curl_request(
     char **response_body,
     int *http_code,
     char **err_out) {
-  char req_path[] = "/tmp/chi-req-XXXXXX";
-  char resp_path[] = "/tmp/chi-resp-XXXXXX";
-  char err_path[] = "/tmp/chi-err-XXXXXX";
-  int req_fd = -1;
-  int resp_fd = -1;
-  int err_fd = -1;
-  char *cmd = NULL;
-  size_t cmd_len = 0;
-  size_t cmd_cap = 0;
-  FILE *pipe = NULL;
-  char status_buf[64];
-  char curl_flags[128];
-  int status = 0;
-  size_t i;
+  static int curl_global_ready = 0;
+  CURL *curl = NULL;
+  struct curl_slist *curl_headers = NULL;
+  chi_http_buffer body;
   int ok = 0;
-  int req_created = 0;
-  int resp_created = 0;
-  int err_created = 0;
   int connect_timeout = 0;
   int max_time = 0;
-  const char *fail_msg = NULL;
+  const char *fail_msg = "curl request failed";
   char *fail_detail = NULL;
+  char errbuf[CURL_ERROR_SIZE];
+  size_t i;
+  CURLcode curl_code;
+  long status_code = 0;
 
   *response_body = NULL;
   *http_code = 0;
   *err_out = NULL;
+
+  body.data = NULL;
+  body.len = 0;
+  body.cap = 0;
+  memset(errbuf, 0, sizeof(errbuf));
 
   connect_timeout = chi_env_positive_int("CHI_HTTP_CONNECT_TIMEOUT", CHI_HTTP_CONNECT_TIMEOUT_DEFAULT);
   max_time = chi_env_positive_int("CHI_HTTP_MAX_TIME", CHI_HTTP_MAX_TIME_DEFAULT);
@@ -1398,133 +1265,98 @@ static int chi_curl_request(
     max_time = connect_timeout;
   }
 
-  if (request_body != NULL) {
-    if (!chi_prepare_temp_file(req_path, &req_fd, &req_created)) {
-      fail_msg = "failed to create request temp file";
+  if (!curl_global_ready) {
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+      fail_msg = "failed to initialize libcurl";
       goto cleanup;
     }
-
-    if (!chi_write_file(req_path, request_body)) {
-      fail_msg = "failed to write request body";
-      goto cleanup;
-    }
+    curl_global_ready = 1;
   }
 
-  if (!chi_prepare_temp_file(resp_path, &resp_fd, &resp_created)) {
-    fail_msg = "failed to create response temp file";
+  curl = curl_easy_init();
+  if (curl == NULL) {
+    fail_msg = "failed to initialize curl request";
     goto cleanup;
   }
 
-  if (!chi_prepare_temp_file(err_path, &err_fd, &err_created)) {
-    fail_msg = "failed to create curl stderr temp file";
-    goto cleanup;
-  }
-
-  snprintf(
-      curl_flags,
-      sizeof(curl_flags),
-      "curl -q -sS --retry 0 --connect-timeout %d --max-time %d -o ",
-      connect_timeout,
-      max_time);
-  if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, curl_flags, &fail_msg) ||
-      !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, resp_path, &fail_msg) ||
-      !chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " -w '%{http_code}'", &fail_msg)) {
-    goto cleanup;
-  }
+  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)connect_timeout);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)max_time);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, chi_curl_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "chi/1");
 
   if (method != NULL && strcmp(method, "POST") == 0) {
-    if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " -X POST", &fail_msg)) {
-      goto cleanup;
-    }
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  } else {
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
   }
 
   for (i = 0; i < header_count; i++) {
-    if (!chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, " -H ", headers[i], &fail_msg)) {
+    curl_headers = curl_slist_append(curl_headers, headers[i]);
+    if (curl_headers == NULL) {
+      fail_msg = "out of memory while building request headers";
       goto cleanup;
     }
+  }
+  if (curl_headers != NULL) {
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
   }
 
   if (request_body != NULL) {
-    if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " --data-binary @", &fail_msg) ||
-        !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, req_path, &fail_msg)) {
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(request_body));
+  }
+
+  curl_code = curl_easy_perform(curl);
+  if (curl_code != CURLE_OK) {
+    if (!chi_is_blank(errbuf)) {
+      fail_detail = chi_format("curl request failed: %s", errbuf);
+    } else {
+      fail_detail = chi_format("curl request failed: %s", curl_easy_strerror(curl_code));
+    }
+    fail_msg = fail_detail != NULL ? fail_detail : "curl request failed";
+    goto cleanup;
+  }
+
+  if (curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code) != CURLE_OK) {
+    fail_msg = "failed to read HTTP status code";
+    goto cleanup;
+  }
+
+  if (status_code < 0 || status_code > INT32_MAX) {
+    fail_msg = "invalid HTTP status code from curl";
+    goto cleanup;
+  }
+
+  if (body.data == NULL) {
+    body.data = chi_strdup("");
+    if (body.data == NULL) {
+      fail_msg = "out of memory storing response body";
       goto cleanup;
     }
   }
 
-  if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " ", &fail_msg) ||
-      !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, url, &fail_msg)) {
-    goto cleanup;
-  }
-  if (!chi_cmd_append_checked(&cmd, &cmd_len, &cmd_cap, " 2>", &fail_msg) ||
-      !chi_cmd_append_quoted(&cmd, &cmd_len, &cmd_cap, NULL, err_path, &fail_msg)) {
-    goto cleanup;
-  }
-
-  pipe = popen(cmd, "r");
-  if (pipe == NULL) {
-    fail_msg = "failed to run curl";
-    goto cleanup;
-  }
-
-  memset(status_buf, 0, sizeof(status_buf));
-  if (fgets(status_buf, sizeof(status_buf), pipe) == NULL) {
-    status_buf[0] = '\0';
-  }
-
-  status = pclose(pipe);
-  pipe = NULL;
-
-  *response_body = chi_read_file(resp_path);
-  if (*response_body == NULL) {
-    fail_msg = "failed to read curl response body";
-    goto cleanup;
-  }
-
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    char *curl_stderr = chi_read_file(err_path);
-    int exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    if (WIFSIGNALED(status)) {
-      fail_detail = chi_format("curl request terminated by signal %d", WTERMSIG(status));
-    } else if (!chi_is_blank(curl_stderr)) {
-      fail_detail = chi_format("curl request failed (exit %d): %s", exit_status, curl_stderr);
-    } else if (exit_status >= 0) {
-      fail_detail = chi_format("curl request failed (exit %d)", exit_status);
-    }
-    free(curl_stderr);
-    fail_msg = fail_detail != NULL ? fail_detail : "curl request failed";
-    free(*response_body);
-    *response_body = NULL;
-    goto cleanup;
-  }
-
-  *http_code = atoi(status_buf);
+  *response_body = body.data;
+  body.data = NULL;
+  *http_code = (int)status_code;
   ok = 1;
 
 cleanup:
-  if (req_fd >= 0) {
-    close(req_fd);
+  if (curl_headers != NULL) {
+    curl_slist_free_all(curl_headers);
   }
-  if (resp_fd >= 0) {
-    close(resp_fd);
+  if (curl != NULL) {
+    curl_easy_cleanup(curl);
   }
-  if (err_fd >= 0) {
-    close(err_fd);
-  }
-  if (pipe != NULL) {
-    pclose(pipe);
-  }
-  free(cmd);
-  if (resp_created) {
-    unlink(resp_path);
-  }
-  if (req_created) {
-    unlink(req_path);
-  }
-  if (err_created) {
-    unlink(err_path);
-  }
-  if (!ok && fail_msg != NULL) {
+  free(body.data);
+  if (!ok) {
     *err_out = chi_strdup(fail_msg);
+    if (*err_out == NULL) {
+      *err_out = chi_strdup("request failed (and out of memory while reporting error)");
+    }
   }
   free(fail_detail);
   return ok;
