@@ -228,7 +228,7 @@ static int chi_append(char **buf, size_t *len, size_t *cap, const char *text) {
   return chi_append_n(buf, len, cap, text, strlen(text));
 }
 
-static char *chi_read_text_file(const char *path, char **err_out) {
+static char *chi_read_named_text_file(const char *path, const char *label, char **err_out) {
   FILE *fp;
   char chunk[4096];
   size_t n;
@@ -239,13 +239,13 @@ static char *chi_read_text_file(const char *path, char **err_out) {
   *err_out = NULL;
 
   if (chi_is_blank(path)) {
-    *err_out = chi_strdup("system prompt file path is blank");
+    *err_out = chi_format("%s path is blank", label == NULL ? "file" : label);
     return NULL;
   }
 
   fp = fopen(path, "rb");
   if (fp == NULL) {
-    *err_out = chi_format("failed to open system prompt file '%s': %s", path, strerror(errno));
+    *err_out = chi_format("failed to open %s '%s': %s", label == NULL ? "file" : label, path, strerror(errno));
     return NULL;
   }
 
@@ -253,7 +253,7 @@ static char *chi_read_text_file(const char *path, char **err_out) {
     if (!chi_append_n(&buf, &len, &cap, chunk, n)) {
       free(buf);
       fclose(fp);
-      *err_out = chi_strdup("out of memory while loading system prompt file");
+      *err_out = chi_format("out of memory while loading %s", label == NULL ? "file" : label);
       return NULL;
     }
   }
@@ -261,23 +261,27 @@ static char *chi_read_text_file(const char *path, char **err_out) {
   if (ferror(fp)) {
     free(buf);
     fclose(fp);
-    *err_out = chi_format("failed to read system prompt file '%s': %s", path, strerror(errno));
+    *err_out = chi_format("failed to read %s '%s': %s", label == NULL ? "file" : label, path, strerror(errno));
     return NULL;
   }
 
   if (fclose(fp) != 0) {
     free(buf);
-    *err_out = chi_format("failed to close system prompt file '%s': %s", path, strerror(errno));
+    *err_out = chi_format("failed to close %s '%s': %s", label == NULL ? "file" : label, path, strerror(errno));
     return NULL;
   }
 
   if (chi_is_blank(buf)) {
     free(buf);
-    *err_out = chi_format("system prompt file '%s' is empty", path);
+    *err_out = chi_format("%s '%s' is empty", label == NULL ? "file" : label, path);
     return NULL;
   }
 
   return buf;
+}
+
+static char *chi_read_text_file(const char *path, char **err_out) {
+  return chi_read_named_text_file(path, "system prompt file", err_out);
 }
 
 static long long chi_now_ms(void) {
@@ -579,6 +583,74 @@ static char *chi_json_get_string(const char *json, const char *key) {
   if (out == NULL) {
     return chi_strdup("");
   }
+  return out;
+}
+
+static char *chi_json_get_object(const char *json, const char *key) {
+  const char *p;
+  const char *start;
+  const char *end = NULL;
+  int depth = 0;
+  int in_string = 0;
+  int escaped = 0;
+  size_t n;
+  char *out;
+
+  p = chi_find_json_key(json, key);
+  if (p == NULL || *p != '{') {
+    return NULL;
+  }
+
+  start = p;
+  while (*p != '\0') {
+    char c = *p;
+
+    if (in_string) {
+      if (escaped) {
+        escaped = 0;
+      } else if (c == '\\') {
+        escaped = 1;
+      } else if (c == '"') {
+        in_string = 0;
+      }
+      p++;
+      continue;
+    }
+
+    if (c == '"') {
+      in_string = 1;
+      p++;
+      continue;
+    }
+
+    if (c == '{') {
+      depth++;
+    } else if (c == '}') {
+      depth--;
+      if (depth == 0) {
+        end = p;
+        break;
+      }
+      if (depth < 0) {
+        return NULL;
+      }
+    }
+
+    p++;
+  }
+
+  if (end == NULL) {
+    return NULL;
+  }
+
+  n = (size_t)(end - start + 1);
+  out = (char *)malloc(n + 1);
+  if (out == NULL) {
+    return NULL;
+  }
+
+  memcpy(out, start, n);
+  out[n] = '\0';
   return out;
 }
 
@@ -2592,13 +2664,12 @@ static int chi_provider_openai(
 
 static int chi_resolve_chatgpt_access_token(chi_config *cfg, char **token_out, char **err_out) {
   const char *direct;
-  const char *session;
-  char *auth_resp = NULL;
-  char *cookie = NULL;
   char *tmp_err = NULL;
+  char *auth_path = NULL;
+  char *auth_json = NULL;
+  char *tokens_json = NULL;
   char *token = NULL;
-  const char *headers[2];
-  int http_code = 0;
+  const char *home;
 
   *token_out = NULL;
   *err_out = NULL;
@@ -2615,49 +2686,42 @@ static int chi_resolve_chatgpt_access_token(chi_config *cfg, char **token_out, c
     return cfg->chatgpt_access_token != NULL && *token_out != NULL;
   }
 
-  session = getenv("CHATGPT_SESSION_TOKEN");
-  if (chi_is_blank(session)) {
-    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or CHATGPT_SESSION_TOKEN for chatgpt backend");
+  home = getenv("HOME");
+  if (chi_is_blank(home)) {
+    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
     return 0;
   }
 
-  cookie = chi_format("Cookie: __Secure-next-auth.session-token=%s", session);
-  if (cookie == NULL) {
-    *err_out = chi_strdup("out of memory while building session cookie header");
+  auth_path = chi_format("%s/.codex/auth.json", home);
+  if (auth_path == NULL) {
+    *err_out = chi_strdup("out of memory while building ~/.codex/auth.json path");
     return 0;
   }
 
-  headers[0] = cookie;
-  headers[1] = "Content-Type: application/json";
-
-  if (!chi_curl_request(
-          "GET",
-          "https://chatgpt.com/api/auth/session",
-          headers,
-          2,
-          NULL,
-          &auth_resp,
-          &http_code,
-          &tmp_err)) {
-    *err_out = tmp_err;
-    free(cookie);
+  auth_json = chi_read_named_text_file(auth_path, "codex auth file", &tmp_err);
+  if (auth_json == NULL) {
+    free(auth_path);
+    free(tmp_err);
+    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
     return 0;
   }
 
-  free(cookie);
-
-  if (http_code < 200 || http_code >= 300) {
-    *err_out = chi_format("chatgpt auth http %d: %s", http_code, auth_resp);
-    free(auth_resp);
+  tokens_json = chi_json_get_object(auth_json, "tokens");
+  if (tokens_json == NULL) {
+    free(auth_json);
+    free(auth_path);
+    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
     return 0;
   }
 
-  token = chi_json_get_string(auth_resp, "accessToken");
-  free(auth_resp);
+  token = chi_json_get_string(tokens_json, "access_token");
+  free(tokens_json);
+  free(auth_json);
+  free(auth_path);
 
   if (chi_is_blank(token)) {
     free(token);
-    *err_out = chi_strdup("failed to parse accessToken from chatgpt auth session response");
+    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
     return 0;
   }
 
@@ -2830,8 +2894,7 @@ static void chi_usage(const char *argv0) {
           "\n"
           "env:\n"
           "  OPENAI_API_KEY               auth for openai backend\n"
-          "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend\n"
-          "  CHATGPT_SESSION_TOKEN        alternate auth for chatgpt backend\n"
+          "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend (else ~/.codex/auth.json)\n"
           "  CHI_BACKEND                  default backend (openai|chatgpt)\n"
           "  CHI_MODEL                    default model (default: gpt-5.2-codex)\n"
           "  CHI_REASONING_EFFORT         default reasoning effort (default: high)\n"

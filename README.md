@@ -60,7 +60,7 @@ You can combine that with the existing queueing support:
 ## Backends And Auth
 
 - `openai` backend (default): set `OPENAI_API_KEY`
-- `chatgpt` backend: set `CHATGPT_ACCESS_TOKEN` or `CHATGPT_SESSION_TOKEN`
+- `chatgpt` backend: uses `CHATGPT_ACCESS_TOKEN` when set, otherwise falls back to `~/.codex/auth.json` `tokens.access_token`
 - optional network tuning:
   - `CHI_MODEL` (same as passing `--model`, default `gpt-5.2-codex`)
   - `CHI_REASONING_EFFORT` (same as passing `--reasoning`, default `high`)
@@ -72,5 +72,5 @@ You can combine that with the existing queueing support:
 Example:
 
 ```bash
-CHI_BACKEND=chatgpt CHATGPT_ACCESS_TOKEN=$CHATGPT_ACCESS_TOKEN ./chi "List files" .
+CHI_BACKEND=chatgpt ./chi "List files" .
 ```
