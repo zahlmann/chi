@@ -22,7 +22,7 @@ cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_p
 
 ```bash
 ./chi \
-  --model gpt-5.2-codex \
+  --model gpt-5.4 \
   "Use bash to create hello.py and run it with uv run hello.py" \
   .
 ```
@@ -62,7 +62,7 @@ You can combine that with the existing queueing support:
 - `chatgpt` backend (default): uses `CHATGPT_ACCESS_TOKEN` when set, otherwise falls back to `~/.codex/auth.json` `tokens.access_token`
 - `openai` backend: set `OPENAI_API_KEY` and pass `--backend openai` or `CHI_BACKEND=openai`
 - optional network tuning:
-  - `CHI_MODEL` (same as passing `--model`, default `gpt-5.2-codex`)
+  - `CHI_MODEL` (same as passing `--model`, default `gpt-5.4`)
   - `CHI_REASONING_EFFORT` (same as passing `--reasoning`, default `high`)
   - `CHI_SESSION_DIR` (session state dir, default `.chi-sessions`)
   - `CHI_SYSTEM_PROMPT_FILE` (custom system prompt text file)
