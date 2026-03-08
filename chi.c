@@ -2297,6 +2297,7 @@ static int chi_append_responses_input(
 
 static char *chi_build_request_json(const chi_config *cfg, const chi_conversation *conversation, char **err_out) {
   const char *system_prompt = cfg->system_prompt_text;
+  const char *input_system_prompt = cfg->backend == CHI_BACKEND_CHATGPT ? NULL : system_prompt;
   const char *reasoning_effort = chi_normalize_reasoning_effort(cfg->reasoning_effort);
   const char *apply_patch_description =
       "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.";
@@ -2339,7 +2340,7 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
       !chi_append(&json, &len, &cap, "\"model\":") ||
       !chi_append_json_quoted(&json, &len, &cap, cfg->model) ||
       !chi_append(&json, &len, &cap, ",") ||
-      !chi_append_responses_input(conversation, system_prompt, &json, &len, &cap) ||
+      !chi_append_responses_input(conversation, input_system_prompt, &json, &len, &cap) ||
       !chi_append(&json, &len, &cap, ",\"tools\":[") ||
       !chi_append(&json, &len, &cap, bash_tool_json) ||
       !chi_append(&json, &len, &cap, ",{\"type\":\"custom\",\"name\":\"apply_patch\",\"description\":") ||
@@ -2367,7 +2368,8 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
   }
 
   if (cfg->backend == CHI_BACKEND_CHATGPT) {
-    if (!chi_append(&json, &len, &cap, ",\"instructions\":\"\"")) {
+    if (!chi_append(&json, &len, &cap, ",\"instructions\":") ||
+        !chi_append_json_quoted(&json, &len, &cap, system_prompt == NULL ? "" : system_prompt)) {
       free(json);
       *err_out = chi_strdup("out of memory while building provider request");
       return NULL;
