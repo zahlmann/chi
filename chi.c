@@ -2898,7 +2898,7 @@ static void chi_usage(const char *argv0) {
           "  OPENAI_API_KEY               auth for openai backend when selected\n"
           "  CHATGPT_ACCESS_TOKEN         direct auth for default chatgpt backend (else ~/.codex/auth.json)\n"
           "  CHI_BACKEND                  backend override (default: chatgpt; openai|chatgpt)\n"
-          "  CHI_MODEL                    default model (default: gpt-5.2-codex)\n"
+          "  CHI_MODEL                    default model (default: gpt-5.4)\n"
           "  CHI_REASONING_EFFORT         default reasoning effort (default: high)\n"
           "  CHI_SESSION_DIR              session state dir (default: .chi-sessions)\n"
           "  CHI_SYSTEM_PROMPT_FILE       path to custom system prompt text file\n"
@@ -2964,7 +2964,7 @@ int main(int argc, char **argv) {
 
   cfg.model = getenv("CHI_MODEL");
   if (chi_is_blank(cfg.model)) {
-    cfg.model = "gpt-5.2-codex";
+    cfg.model = "gpt-5.4";
   }
   cfg.reasoning_effort = getenv("CHI_REASONING_EFFORT");
   if (chi_is_blank(cfg.reasoning_effort)) {
