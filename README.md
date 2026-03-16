@@ -15,7 +15,33 @@ It is intentionally small.
 
 ```bash
 cd chi
-cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L chi.c apply_patch.c -lcurl -o chi
+make
+```
+
+If the build fails with `fatal error: curl/curl.h: No such file or directory`, install the libcurl development package first:
+
+```bash
+# Debian/Ubuntu
+sudo apt install libcurl4-openssl-dev pkg-config
+
+# Fedora/RHEL
+sudo dnf install libcurl-devel pkgconf-pkg-config
+```
+
+If `make` says `pkg-config not found`, install `pkg-config` first or pass the flags manually:
+
+```bash
+make CURL_CFLAGS="..." CURL_LIBS="..."
+```
+
+You can still compile manually if needed:
+
+```bash
+cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L \
+  $(pkg-config --cflags libcurl) \
+  chi.c apply_patch.c \
+  $(pkg-config --libs libcurl) \
+  -o chi
 ```
 
 ## Run Live Agent

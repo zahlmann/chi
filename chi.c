@@ -15,6 +15,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__has_include) && !__has_include(<curl/curl.h>)
+#error "libcurl headers not found; install libcurl4-openssl-dev (Debian/Ubuntu) or libcurl-devel (Fedora/RHEL), then build with make"
+#else
 #include <curl/curl.h>
 
 #include "apply_patch.h"
@@ -4692,3 +4695,4 @@ cleanup:
   chi_clear_chatgpt_auth_cache(&cfg);
   return exit_code;
 }
+#endif
