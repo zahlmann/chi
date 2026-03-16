@@ -25,6 +25,16 @@
 #define CHI_SESSION_ID_MAX 64
 #define CHI_HTTP_CONNECT_TIMEOUT_DEFAULT 5
 #define CHI_HTTP_MAX_TIME_DEFAULT 120
+#define CHI_CHATGPT_CLIENT_ID "app_EMoamEEZ73f0CkXaXp7hrann"
+#define CHI_CHATGPT_AUTHORIZE_URL "https://auth.openai.com/oauth/authorize"
+#define CHI_CHATGPT_TOKEN_URL "https://auth.openai.com/oauth/token"
+#define CHI_CHATGPT_REDIRECT_URI "http://localhost:1455/auth/callback"
+#define CHI_CHATGPT_SCOPE "openid profile email offline_access"
+#define CHI_CHATGPT_JWT_CLAIM_PATH "https://api.openai.com/auth"
+#define CHI_CHATGPT_AUTH_SOURCE_NONE 0
+#define CHI_CHATGPT_AUTH_SOURCE_ENV 1
+#define CHI_CHATGPT_AUTH_SOURCE_CHI_FILE 2
+#define CHI_CHATGPT_AUTH_SOURCE_LEGACY_CODEX 3
 
 typedef enum {
   CHI_BACKEND_OPENAI = 0,
@@ -86,6 +96,11 @@ typedef struct {
   char *loaded_reasoning_effort;
   char *loaded_working_dir;
   char *chatgpt_access_token;
+  char *chatgpt_refresh_token;
+  char *chatgpt_account_id;
+  long long chatgpt_expires_at_ms;
+  int chatgpt_auth_source;
+  int chatgpt_login_attempted;
 } chi_config;
 
 static int chi_parse_backend(const char *value, chi_backend *out);
@@ -1434,6 +1449,1310 @@ cleanup:
   return ok;
 }
 
+typedef struct {
+  uint32_t state[8];
+  uint64_t bitlen;
+  unsigned char data[64];
+  size_t datalen;
+} chi_sha256_ctx;
+
+static uint32_t chi_sha256_rotr(uint32_t x, uint32_t n) {
+  return (x >> n) | (x << (32 - n));
+}
+
+static void chi_sha256_transform(chi_sha256_ctx *ctx, const unsigned char data[64]) {
+  static const uint32_t k[64] = {
+      0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u,
+      0xab1c5ed5u, 0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu,
+      0x9bdc06a7u, 0xc19bf174u, 0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu,
+      0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau, 0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+      0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu,
+      0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u, 0xa2bfe8a1u, 0xa81a664bu,
+      0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u, 0x19a4c116u,
+      0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+      0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u,
+      0xc67178f2u};
+  uint32_t a;
+  uint32_t b;
+  uint32_t c;
+  uint32_t d;
+  uint32_t e;
+  uint32_t f;
+  uint32_t g;
+  uint32_t h;
+  uint32_t m[64];
+  uint32_t s0;
+  uint32_t s1;
+  uint32_t ch;
+  uint32_t maj;
+  uint32_t temp1;
+  uint32_t temp2;
+  int i;
+
+  for (i = 0; i < 16; i++) {
+    m[i] = ((uint32_t)data[i * 4] << 24) | ((uint32_t)data[i * 4 + 1] << 16) | ((uint32_t)data[i * 4 + 2] << 8) |
+           (uint32_t)data[i * 4 + 3];
+  }
+  for (i = 16; i < 64; i++) {
+    s0 = chi_sha256_rotr(m[i - 15], 7) ^ chi_sha256_rotr(m[i - 15], 18) ^ (m[i - 15] >> 3);
+    s1 = chi_sha256_rotr(m[i - 2], 17) ^ chi_sha256_rotr(m[i - 2], 19) ^ (m[i - 2] >> 10);
+    m[i] = m[i - 16] + s0 + m[i - 7] + s1;
+  }
+
+  a = ctx->state[0];
+  b = ctx->state[1];
+  c = ctx->state[2];
+  d = ctx->state[3];
+  e = ctx->state[4];
+  f = ctx->state[5];
+  g = ctx->state[6];
+  h = ctx->state[7];
+
+  for (i = 0; i < 64; i++) {
+    s1 = chi_sha256_rotr(e, 6) ^ chi_sha256_rotr(e, 11) ^ chi_sha256_rotr(e, 25);
+    ch = (e & f) ^ ((~e) & g);
+    temp1 = h + s1 + ch + k[i] + m[i];
+    s0 = chi_sha256_rotr(a, 2) ^ chi_sha256_rotr(a, 13) ^ chi_sha256_rotr(a, 22);
+    maj = (a & b) ^ (a & c) ^ (b & c);
+    temp2 = s0 + maj;
+
+    h = g;
+    g = f;
+    f = e;
+    e = d + temp1;
+    d = c;
+    c = b;
+    b = a;
+    a = temp1 + temp2;
+  }
+
+  ctx->state[0] += a;
+  ctx->state[1] += b;
+  ctx->state[2] += c;
+  ctx->state[3] += d;
+  ctx->state[4] += e;
+  ctx->state[5] += f;
+  ctx->state[6] += g;
+  ctx->state[7] += h;
+}
+
+static void chi_sha256_init(chi_sha256_ctx *ctx) {
+  memset(ctx, 0, sizeof(*ctx));
+  ctx->state[0] = 0x6a09e667u;
+  ctx->state[1] = 0xbb67ae85u;
+  ctx->state[2] = 0x3c6ef372u;
+  ctx->state[3] = 0xa54ff53au;
+  ctx->state[4] = 0x510e527fu;
+  ctx->state[5] = 0x9b05688cu;
+  ctx->state[6] = 0x1f83d9abu;
+  ctx->state[7] = 0x5be0cd19u;
+}
+
+static void chi_sha256_update(chi_sha256_ctx *ctx, const unsigned char *data, size_t len) {
+  size_t i;
+
+  for (i = 0; i < len; i++) {
+    ctx->data[ctx->datalen++] = data[i];
+    if (ctx->datalen == sizeof(ctx->data)) {
+      chi_sha256_transform(ctx, ctx->data);
+      ctx->bitlen += 512;
+      ctx->datalen = 0;
+    }
+  }
+}
+
+static void chi_sha256_final(chi_sha256_ctx *ctx, unsigned char out[32]) {
+  size_t i;
+
+  ctx->bitlen += (uint64_t)ctx->datalen * 8u;
+  ctx->data[ctx->datalen++] = 0x80u;
+
+  if (ctx->datalen > 56) {
+    while (ctx->datalen < 64) {
+      ctx->data[ctx->datalen++] = 0;
+    }
+    chi_sha256_transform(ctx, ctx->data);
+    ctx->datalen = 0;
+  }
+
+  while (ctx->datalen < 56) {
+    ctx->data[ctx->datalen++] = 0;
+  }
+
+  for (i = 0; i < 8; i++) {
+    ctx->data[63 - i] = (unsigned char)((ctx->bitlen >> (i * 8)) & 0xffu);
+  }
+  chi_sha256_transform(ctx, ctx->data);
+
+  for (i = 0; i < 8; i++) {
+    out[i * 4] = (unsigned char)((ctx->state[i] >> 24) & 0xffu);
+    out[i * 4 + 1] = (unsigned char)((ctx->state[i] >> 16) & 0xffu);
+    out[i * 4 + 2] = (unsigned char)((ctx->state[i] >> 8) & 0xffu);
+    out[i * 4 + 3] = (unsigned char)(ctx->state[i] & 0xffu);
+  }
+}
+
+static void chi_sha256_sum(const unsigned char *data, size_t len, unsigned char out[32]) {
+  chi_sha256_ctx ctx;
+  chi_sha256_init(&ctx);
+  chi_sha256_update(&ctx, data, len);
+  chi_sha256_final(&ctx, out);
+}
+
+static char *chi_base64url_encode(const unsigned char *data, size_t len) {
+  static const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  char *out;
+  size_t out_len;
+  size_t i;
+  size_t j = 0;
+
+  out_len = (len / 3u) * 4u;
+  if (len % 3u == 1u) {
+    out_len += 2u;
+  } else if (len % 3u == 2u) {
+    out_len += 3u;
+  }
+
+  out = (char *)malloc(out_len + 1u);
+  if (out == NULL) {
+    return NULL;
+  }
+
+  for (i = 0; i + 3u <= len; i += 3u) {
+    uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | (uint32_t)data[i + 2];
+    out[j++] = alphabet[(v >> 18) & 63u];
+    out[j++] = alphabet[(v >> 12) & 63u];
+    out[j++] = alphabet[(v >> 6) & 63u];
+    out[j++] = alphabet[v & 63u];
+  }
+
+  if (len % 3u == 1u) {
+    uint32_t v = (uint32_t)data[i] << 16;
+    out[j++] = alphabet[(v >> 18) & 63u];
+    out[j++] = alphabet[(v >> 12) & 63u];
+  } else if (len % 3u == 2u) {
+    uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8);
+    out[j++] = alphabet[(v >> 18) & 63u];
+    out[j++] = alphabet[(v >> 12) & 63u];
+    out[j++] = alphabet[(v >> 6) & 63u];
+  }
+
+  out[j] = '\0';
+  return out;
+}
+
+static int chi_base64url_value(char c) {
+  if (c >= 'A' && c <= 'Z') {
+    return c - 'A';
+  }
+  if (c >= 'a' && c <= 'z') {
+    return c - 'a' + 26;
+  }
+  if (c >= '0' && c <= '9') {
+    return c - '0' + 52;
+  }
+  if (c == '-' || c == '+') {
+    return 62;
+  }
+  if (c == '_' || c == '/') {
+    return 63;
+  }
+  return -1;
+}
+
+static unsigned char *chi_base64url_decode(const char *input, size_t *out_len) {
+  size_t len;
+  size_t padded_len;
+  char *padded = NULL;
+  unsigned char *out = NULL;
+  size_t i;
+  size_t j = 0;
+
+  if (out_len != NULL) {
+    *out_len = 0;
+  }
+  if (input == NULL) {
+    return NULL;
+  }
+
+  len = strlen(input);
+  padded_len = ((len + 3u) / 4u) * 4u;
+  padded = (char *)malloc(padded_len + 1u);
+  out = (unsigned char *)malloc((padded_len / 4u) * 3u + 1u);
+  if (padded == NULL || out == NULL) {
+    free(padded);
+    free(out);
+    return NULL;
+  }
+
+  memcpy(padded, input, len);
+  for (i = len; i < padded_len; i++) {
+    padded[i] = '=';
+  }
+  padded[padded_len] = '\0';
+
+  for (i = 0; i < padded_len; i += 4u) {
+    int a = chi_base64url_value(padded[i]);
+    int b = chi_base64url_value(padded[i + 1]);
+    int c = padded[i + 2] == '=' ? -2 : chi_base64url_value(padded[i + 2]);
+    int d = padded[i + 3] == '=' ? -2 : chi_base64url_value(padded[i + 3]);
+    uint32_t v;
+
+    if (a < 0 || b < 0 || c == -1 || d == -1) {
+      free(padded);
+      free(out);
+      return NULL;
+    }
+
+    v = ((uint32_t)a << 18) | ((uint32_t)b << 12);
+    if (c >= 0) {
+      v |= (uint32_t)c << 6;
+    }
+    if (d >= 0) {
+      v |= (uint32_t)d;
+    }
+
+    out[j++] = (unsigned char)((v >> 16) & 0xffu);
+    if (c >= 0) {
+      out[j++] = (unsigned char)((v >> 8) & 0xffu);
+    }
+    if (d >= 0) {
+      out[j++] = (unsigned char)(v & 0xffu);
+    }
+  }
+
+  free(padded);
+  if (out_len != NULL) {
+    *out_len = j;
+  }
+  return out;
+}
+
+static char *chi_url_encode_dup(const char *text) {
+  CURL *curl;
+  char *encoded;
+  char *copy;
+
+  if (text == NULL) {
+    return chi_strdup("");
+  }
+
+  curl = curl_easy_init();
+  if (curl == NULL) {
+    return NULL;
+  }
+
+  encoded = curl_easy_escape(curl, text, 0);
+  curl_easy_cleanup(curl);
+  if (encoded == NULL) {
+    return NULL;
+  }
+
+  copy = chi_strdup(encoded);
+  curl_free(encoded);
+  return copy;
+}
+
+static char *chi_url_decode_dup(const char *text) {
+  CURL *curl;
+  char *decoded;
+  char *copy;
+  int out_len = 0;
+
+  if (text == NULL) {
+    return NULL;
+  }
+
+  curl = curl_easy_init();
+  if (curl == NULL) {
+    return NULL;
+  }
+
+  decoded = curl_easy_unescape(curl, text, 0, &out_len);
+  curl_easy_cleanup(curl);
+  if (decoded == NULL) {
+    return NULL;
+  }
+
+  copy = (char *)malloc((size_t)out_len + 1u);
+  if (copy != NULL) {
+    memcpy(copy, decoded, (size_t)out_len);
+    copy[out_len] = '\0';
+  }
+  curl_free(decoded);
+  return copy;
+}
+
+static int chi_can_prompt_user(void) {
+  FILE *tty = fopen("/dev/tty", "r+");
+  if (tty != NULL) {
+    fclose(tty);
+    return 1;
+  }
+  return isatty(STDIN_FILENO) != 0;
+}
+
+static char *chi_prompt_line(const char *prompt, char **err_out) {
+  FILE *tty = NULL;
+  char *line = NULL;
+  size_t cap = 0;
+  ssize_t nread;
+
+  *err_out = NULL;
+
+  tty = fopen("/dev/tty", "r+");
+  if (tty == NULL) {
+    if (!isatty(STDIN_FILENO)) {
+      *err_out = chi_strdup("interactive login requires a terminal");
+      return NULL;
+    }
+    tty = stdin;
+  }
+
+  fprintf(tty == stdin ? stderr : tty, "%s", prompt == NULL ? "" : prompt);
+  fflush(tty == stdin ? stderr : tty);
+
+  nread = getline(&line, &cap, tty == stdin ? stdin : tty);
+  if (tty != stdin) {
+    fclose(tty);
+  }
+  if (nread < 0) {
+    free(line);
+    *err_out = chi_strdup("failed to read interactive input");
+    return NULL;
+  }
+
+  chi_trim_trailing_newlines(line);
+  return line;
+}
+
+static void chi_try_open_url(const char *url) {
+  pid_t pid;
+
+  if (chi_is_blank(url)) {
+    return;
+  }
+
+  pid = fork();
+  if (pid != 0) {
+    return;
+  }
+
+#if defined(__APPLE__)
+  execlp("open", "open", url, (char *)NULL);
+#else
+  execlp("xdg-open", "xdg-open", url, (char *)NULL);
+#endif
+  _exit(127);
+}
+
+static char *chi_home_join(const char *suffix, char **err_out) {
+  const char *home = getenv("HOME");
+
+  *err_out = NULL;
+  if (chi_is_blank(home)) {
+    *err_out = chi_strdup("HOME is not set");
+    return NULL;
+  }
+
+  return chi_format("%s/%s", home, suffix);
+}
+
+static void chi_clear_chatgpt_auth_cache(chi_config *cfg) {
+  if (cfg == NULL) {
+    return;
+  }
+  free(cfg->chatgpt_access_token);
+  free(cfg->chatgpt_refresh_token);
+  free(cfg->chatgpt_account_id);
+  cfg->chatgpt_access_token = NULL;
+  cfg->chatgpt_refresh_token = NULL;
+  cfg->chatgpt_account_id = NULL;
+  cfg->chatgpt_expires_at_ms = 0;
+  cfg->chatgpt_auth_source = CHI_CHATGPT_AUTH_SOURCE_NONE;
+}
+
+static int chi_set_chatgpt_auth_cache(
+    chi_config *cfg,
+    const char *access_token,
+    const char *refresh_token,
+    const char *account_id,
+    long long expires_at_ms,
+    int auth_source) {
+  char *access_copy = NULL;
+  char *refresh_copy = NULL;
+  char *account_copy = NULL;
+
+  if (cfg == NULL || chi_is_blank(access_token) || chi_is_blank(account_id)) {
+    return 0;
+  }
+
+  access_copy = chi_strdup(access_token);
+  if (access_copy == NULL) {
+    return 0;
+  }
+  if (!chi_is_blank(refresh_token)) {
+    refresh_copy = chi_strdup(refresh_token);
+    if (refresh_copy == NULL) {
+      free(access_copy);
+      return 0;
+    }
+  }
+  account_copy = chi_strdup(account_id);
+  if (account_copy == NULL) {
+    free(access_copy);
+    free(refresh_copy);
+    return 0;
+  }
+
+  chi_clear_chatgpt_auth_cache(cfg);
+  cfg->chatgpt_access_token = access_copy;
+  cfg->chatgpt_refresh_token = refresh_copy;
+  cfg->chatgpt_account_id = account_copy;
+  cfg->chatgpt_expires_at_ms = expires_at_ms;
+  cfg->chatgpt_auth_source = auth_source;
+  return 1;
+}
+
+static char *chi_build_chi_auth_path(char **err_out) {
+  return chi_home_join(".chi/auth.json", err_out);
+}
+
+static char *chi_build_legacy_codex_auth_path(char **err_out) {
+  return chi_home_join(".codex/auth.json", err_out);
+}
+
+static int chi_write_private_text_file(const char *path, const char *text, char **err_out) {
+  FILE *fp;
+  int fd;
+  char *dir_path = NULL;
+  char *slash;
+
+  *err_out = NULL;
+  if (chi_is_blank(path)) {
+    *err_out = chi_strdup("auth file path is blank");
+    return 0;
+  }
+
+  dir_path = chi_strdup(path);
+  if (dir_path == NULL) {
+    *err_out = chi_strdup("out of memory while preparing auth directory");
+    return 0;
+  }
+  slash = strrchr(dir_path, '/');
+  if (slash != NULL) {
+    *slash = '\0';
+    if (!chi_ensure_directory(dir_path, err_out)) {
+      free(dir_path);
+      return 0;
+    }
+  }
+  free(dir_path);
+
+  fp = fopen(path, "wb");
+  if (fp == NULL) {
+    *err_out = chi_format("failed to open auth file '%s': %s", path, strerror(errno));
+    return 0;
+  }
+
+  if (fwrite(text, 1, strlen(text), fp) != strlen(text)) {
+    *err_out = chi_format("failed to write auth file '%s': %s", path, strerror(errno));
+    fclose(fp);
+    return 0;
+  }
+
+  if (fflush(fp) != 0) {
+    *err_out = chi_format("failed to flush auth file '%s': %s", path, strerror(errno));
+    fclose(fp);
+    return 0;
+  }
+
+  fd = fileno(fp);
+  if (fd >= 0) {
+    (void)fchmod(fd, 0600);
+  }
+  if (fclose(fp) != 0) {
+    *err_out = chi_format("failed to close auth file '%s': %s", path, strerror(errno));
+    return 0;
+  }
+
+  return 1;
+}
+
+static char *chi_extract_param_value(const char *text, const char *name) {
+  char *needle;
+  const char *p;
+  char *raw = NULL;
+  char *decoded = NULL;
+  size_t name_len;
+  const char *end;
+
+  if (chi_is_blank(text) || chi_is_blank(name)) {
+    return NULL;
+  }
+
+  name_len = strlen(name);
+  needle = chi_format("%s=", name);
+  if (needle == NULL) {
+    return NULL;
+  }
+
+  p = text;
+  while ((p = strstr(p, needle)) != NULL) {
+    if (p == text || p[-1] == '?' || p[-1] == '&' || p[-1] == '#') {
+      p += name_len + 1;
+      end = p;
+      while (*end != '\0' && *end != '&' && *end != '#' && !isspace((unsigned char)*end)) {
+        end++;
+      }
+      raw = (char *)malloc((size_t)(end - p) + 1);
+      if (raw == NULL) {
+        break;
+      }
+      memcpy(raw, p, (size_t)(end - p));
+      raw[end - p] = '\0';
+      decoded = chi_url_decode_dup(raw);
+      free(raw);
+      free(needle);
+      return decoded;
+    }
+    p += name_len + 1;
+  }
+
+  free(needle);
+  return NULL;
+}
+
+static int chi_parse_chatgpt_authorization_input(
+    const char *input,
+    char **code_out,
+    char **state_out,
+    char **err_out) {
+  char *trimmed = NULL;
+  char *code = NULL;
+  char *state = NULL;
+  char *hash = NULL;
+
+  *code_out = NULL;
+  *state_out = NULL;
+  *err_out = NULL;
+
+  if (chi_is_blank(input)) {
+    *err_out = chi_strdup("authorization input is blank");
+    return 0;
+  }
+
+  trimmed = chi_strdup(input);
+  if (trimmed == NULL) {
+    *err_out = chi_strdup("out of memory while parsing authorization input");
+    return 0;
+  }
+  while (*trimmed != '\0' && isspace((unsigned char)*trimmed)) {
+    memmove(trimmed, trimmed + 1, strlen(trimmed));
+  }
+  chi_trim_trailing_newlines(trimmed);
+
+  code = chi_extract_param_value(trimmed, "code");
+  state = chi_extract_param_value(trimmed, "state");
+  if (code == NULL) {
+    hash = strchr(trimmed, '#');
+    if (hash != NULL) {
+      *hash = '\0';
+      hash++;
+      code = chi_strdup(trimmed);
+      state = chi_strdup_nonblank_or_null(hash);
+    } else {
+      code = chi_strdup(trimmed);
+    }
+  }
+  free(trimmed);
+
+  if (chi_is_blank(code)) {
+    free(code);
+    free(state);
+    *err_out = chi_strdup("missing authorization code");
+    return 0;
+  }
+
+  *code_out = code;
+  *state_out = state;
+  return 1;
+}
+
+static char *chi_extract_chatgpt_account_id(const char *access_token) {
+  const char *first_dot;
+  const char *second_dot;
+  char *payload_part = NULL;
+  unsigned char *decoded = NULL;
+  size_t decoded_len = 0;
+  char *payload_json = NULL;
+  char *auth_json = NULL;
+  char *account_id = NULL;
+
+  if (chi_is_blank(access_token)) {
+    return NULL;
+  }
+
+  first_dot = strchr(access_token, '.');
+  if (first_dot == NULL) {
+    return NULL;
+  }
+  second_dot = strchr(first_dot + 1, '.');
+  if (second_dot == NULL || second_dot <= first_dot + 1) {
+    return NULL;
+  }
+
+  payload_part = (char *)malloc((size_t)(second_dot - first_dot - 1) + 1);
+  if (payload_part == NULL) {
+    return NULL;
+  }
+  memcpy(payload_part, first_dot + 1, (size_t)(second_dot - first_dot - 1));
+  payload_part[second_dot - first_dot - 1] = '\0';
+
+  decoded = chi_base64url_decode(payload_part, &decoded_len);
+  free(payload_part);
+  if (decoded == NULL) {
+    return NULL;
+  }
+
+  payload_json = (char *)malloc(decoded_len + 1);
+  if (payload_json == NULL) {
+    free(decoded);
+    return NULL;
+  }
+  memcpy(payload_json, decoded, decoded_len);
+  payload_json[decoded_len] = '\0';
+  free(decoded);
+
+  auth_json = chi_json_get_object(payload_json, CHI_CHATGPT_JWT_CLAIM_PATH);
+  if (auth_json != NULL) {
+    account_id = chi_json_get_string(auth_json, "chatgpt_account_id");
+  }
+
+  free(payload_json);
+  free(auth_json);
+  return chi_is_blank(account_id) ? (free(account_id), (char *)NULL) : account_id;
+}
+
+static int chi_build_chatgpt_pkce_pair(char **verifier_out, char **challenge_out, char **err_out) {
+  unsigned char random_bytes[32];
+  unsigned char digest[32];
+  char *verifier = NULL;
+  char *challenge = NULL;
+  int fd;
+  ssize_t nread;
+
+  *verifier_out = NULL;
+  *challenge_out = NULL;
+  *err_out = NULL;
+
+  fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0) {
+    *err_out = chi_strdup("failed to open /dev/urandom for PKCE");
+    return 0;
+  }
+  nread = read(fd, random_bytes, sizeof(random_bytes));
+  close(fd);
+  if (nread != (ssize_t)sizeof(random_bytes)) {
+    *err_out = chi_strdup("failed to read random bytes for PKCE");
+    return 0;
+  }
+
+  verifier = chi_base64url_encode(random_bytes, sizeof(random_bytes));
+  if (verifier == NULL) {
+    *err_out = chi_strdup("out of memory while building PKCE verifier");
+    return 0;
+  }
+
+  chi_sha256_sum((const unsigned char *)verifier, strlen(verifier), digest);
+  challenge = chi_base64url_encode(digest, sizeof(digest));
+  if (challenge == NULL) {
+    free(verifier);
+    *err_out = chi_strdup("out of memory while building PKCE challenge");
+    return 0;
+  }
+
+  *verifier_out = verifier;
+  *challenge_out = challenge;
+  return 1;
+}
+
+static char *chi_build_chatgpt_authorize_url(const char *challenge, const char *state, char **err_out) {
+  char *redirect = NULL;
+  char *scope = NULL;
+  char *encoded_challenge = NULL;
+  char *encoded_state = NULL;
+  char *url = NULL;
+
+  *err_out = NULL;
+  redirect = chi_url_encode_dup(CHI_CHATGPT_REDIRECT_URI);
+  scope = chi_url_encode_dup(CHI_CHATGPT_SCOPE);
+  encoded_challenge = chi_url_encode_dup(challenge);
+  encoded_state = chi_url_encode_dup(state);
+  if (redirect == NULL || scope == NULL || encoded_challenge == NULL || encoded_state == NULL) {
+    *err_out = chi_strdup("out of memory while building authorization url");
+    goto cleanup;
+  }
+
+  url = chi_format(
+      CHI_CHATGPT_AUTHORIZE_URL
+      "?response_type=code&client_id=%s&redirect_uri=%s&scope=%s&code_challenge=%s&code_challenge_method=S256&"
+      "state=%s&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=pi",
+      CHI_CHATGPT_CLIENT_ID,
+      redirect,
+      scope,
+      encoded_challenge,
+      encoded_state);
+
+cleanup:
+  free(redirect);
+  free(scope);
+  free(encoded_challenge);
+  free(encoded_state);
+  return url;
+}
+
+static int chi_request_chatgpt_tokens(
+    const char *form_body,
+    char **access_token_out,
+    char **refresh_token_out,
+    long long *expires_at_ms_out,
+    char **err_out) {
+  const char *headers[2];
+  char *response_body = NULL;
+  char *tmp_err = NULL;
+  char *access_token = NULL;
+  char *refresh_token = NULL;
+  double expires_in = 0;
+  int http_code = 0;
+
+  *access_token_out = NULL;
+  *refresh_token_out = NULL;
+  *expires_at_ms_out = 0;
+  *err_out = NULL;
+
+  headers[0] = "Content-Type: application/x-www-form-urlencoded";
+  headers[1] = "Accept: application/json";
+
+  if (!chi_curl_request(
+          "POST", CHI_CHATGPT_TOKEN_URL, headers, 2, form_body, &response_body, &http_code, &tmp_err)) {
+    *err_out = tmp_err;
+    return 0;
+  }
+
+  if (http_code < 200 || http_code >= 300) {
+    *err_out = chi_format("chatgpt token endpoint http %d: %s", http_code, response_body);
+    free(response_body);
+    return 0;
+  }
+
+  access_token = chi_json_get_string(response_body, "access_token");
+  refresh_token = chi_json_get_string(response_body, "refresh_token");
+  if (!chi_json_get_number(response_body, "expires_in", &expires_in) || chi_is_blank(access_token) ||
+      chi_is_blank(refresh_token) || expires_in <= 0) {
+    free(access_token);
+    free(refresh_token);
+    free(response_body);
+    *err_out = chi_strdup("chatgpt token response is missing required fields");
+    return 0;
+  }
+
+  *access_token_out = access_token;
+  *refresh_token_out = refresh_token;
+  *expires_at_ms_out = chi_now_ms() + (long long)(expires_in * 1000.0);
+  free(response_body);
+  return 1;
+}
+
+static int chi_exchange_chatgpt_authorization_code(
+    const char *code,
+    const char *verifier,
+    char **access_token_out,
+    char **refresh_token_out,
+    long long *expires_at_ms_out,
+    char **err_out) {
+  char *encoded_code = NULL;
+  char *encoded_verifier = NULL;
+  char *encoded_redirect = NULL;
+  char *form_body = NULL;
+  int ok = 0;
+
+  *err_out = NULL;
+  encoded_code = chi_url_encode_dup(code);
+  encoded_verifier = chi_url_encode_dup(verifier);
+  encoded_redirect = chi_url_encode_dup(CHI_CHATGPT_REDIRECT_URI);
+  if (encoded_code == NULL || encoded_verifier == NULL || encoded_redirect == NULL) {
+    *err_out = chi_strdup("out of memory while preparing token exchange");
+    goto cleanup;
+  }
+
+  form_body = chi_format(
+      "grant_type=authorization_code&client_id=%s&code=%s&code_verifier=%s&redirect_uri=%s",
+      CHI_CHATGPT_CLIENT_ID,
+      encoded_code,
+      encoded_verifier,
+      encoded_redirect);
+  if (form_body == NULL) {
+    *err_out = chi_strdup("out of memory while preparing token exchange");
+    goto cleanup;
+  }
+
+  ok = chi_request_chatgpt_tokens(form_body, access_token_out, refresh_token_out, expires_at_ms_out, err_out);
+
+cleanup:
+  free(encoded_code);
+  free(encoded_verifier);
+  free(encoded_redirect);
+  free(form_body);
+  return ok;
+}
+
+static int chi_refresh_chatgpt_tokens(
+    const char *refresh_token,
+    char **access_token_out,
+    char **refresh_token_out,
+    long long *expires_at_ms_out,
+    char **err_out) {
+  char *encoded_refresh = NULL;
+  char *form_body = NULL;
+  int ok = 0;
+
+  *err_out = NULL;
+  encoded_refresh = chi_url_encode_dup(refresh_token);
+  if (encoded_refresh == NULL) {
+    *err_out = chi_strdup("out of memory while preparing token refresh");
+    return 0;
+  }
+
+  form_body = chi_format(
+      "grant_type=refresh_token&refresh_token=%s&client_id=%s", encoded_refresh, CHI_CHATGPT_CLIENT_ID);
+  if (form_body == NULL) {
+    free(encoded_refresh);
+    *err_out = chi_strdup("out of memory while preparing token refresh");
+    return 0;
+  }
+
+  ok = chi_request_chatgpt_tokens(form_body, access_token_out, refresh_token_out, expires_at_ms_out, err_out);
+  free(encoded_refresh);
+  free(form_body);
+  return ok;
+}
+
+static int chi_save_chatgpt_auth_file(const chi_config *cfg, char **err_out) {
+  char *auth_path = NULL;
+  char *access = NULL;
+  char *refresh = NULL;
+  char *account = NULL;
+  char *json = NULL;
+  int ok = 0;
+
+  *err_out = NULL;
+  if (cfg == NULL || chi_is_blank(cfg->chatgpt_access_token) || chi_is_blank(cfg->chatgpt_refresh_token) ||
+      chi_is_blank(cfg->chatgpt_account_id)) {
+    *err_out = chi_strdup("chatgpt auth cache is incomplete");
+    return 0;
+  }
+
+  auth_path = chi_build_chi_auth_path(err_out);
+  if (auth_path == NULL) {
+    return 0;
+  }
+  access = chi_json_escape(cfg->chatgpt_access_token);
+  refresh = chi_json_escape(cfg->chatgpt_refresh_token);
+  account = chi_json_escape(cfg->chatgpt_account_id);
+  if (access == NULL || refresh == NULL || account == NULL) {
+    *err_out = chi_strdup("out of memory while serializing auth file");
+    goto cleanup;
+  }
+
+  json = chi_format(
+      "{\n"
+      "  \"version\": 1,\n"
+      "  \"chatgpt\": {\n"
+      "    \"access_token\": \"%s\",\n"
+      "    \"refresh_token\": \"%s\",\n"
+      "    \"account_id\": \"%s\",\n"
+      "    \"expires_at_ms\": %lld\n"
+      "  }\n"
+      "}\n",
+      access,
+      refresh,
+      account,
+      cfg->chatgpt_expires_at_ms);
+  if (json == NULL) {
+    *err_out = chi_strdup("out of memory while serializing auth file");
+    goto cleanup;
+  }
+
+  ok = chi_write_private_text_file(auth_path, json, err_out);
+
+cleanup:
+  free(auth_path);
+  free(access);
+  free(refresh);
+  free(account);
+  free(json);
+  return ok;
+}
+
+static int chi_load_chatgpt_auth_file(chi_config *cfg, int *found_out, char **err_out) {
+  char *auth_path = NULL;
+  char *auth_json = NULL;
+  char *chatgpt_json = NULL;
+  char *access_token = NULL;
+  char *refresh_token = NULL;
+  char *account_id = NULL;
+  char *tmp_err = NULL;
+  double expires_num = 0;
+  long long expires_at_ms = 0;
+
+  *found_out = 0;
+  *err_out = NULL;
+
+  auth_path = chi_build_chi_auth_path(&tmp_err);
+  if (auth_path == NULL) {
+    *err_out = tmp_err;
+    return 0;
+  }
+
+  auth_json = chi_read_named_text_file(auth_path, "chi auth file", &tmp_err);
+  if (auth_json == NULL) {
+    if (tmp_err != NULL && strstr(tmp_err, "failed to open") != NULL) {
+      free(tmp_err);
+      free(auth_path);
+      return 1;
+    }
+    *err_out = tmp_err;
+    free(auth_path);
+    return 0;
+  }
+
+  *found_out = 1;
+  chatgpt_json = chi_json_get_object(auth_json, "chatgpt");
+  if (chatgpt_json == NULL) {
+    *err_out = chi_strdup("~/.chi/auth.json is missing the chatgpt object");
+    goto cleanup;
+  }
+
+  access_token = chi_json_get_string(chatgpt_json, "access_token");
+  if (access_token == NULL) {
+    access_token = chi_json_get_string(chatgpt_json, "access");
+  }
+  refresh_token = chi_json_get_string(chatgpt_json, "refresh_token");
+  if (refresh_token == NULL) {
+    refresh_token = chi_json_get_string(chatgpt_json, "refresh");
+  }
+  account_id = chi_json_get_string(chatgpt_json, "account_id");
+  if (account_id == NULL) {
+    account_id = chi_json_get_string(chatgpt_json, "accountId");
+  }
+  if (!chi_json_get_number(chatgpt_json, "expires_at_ms", &expires_num) &&
+      !chi_json_get_number(chatgpt_json, "expires_at", &expires_num) &&
+      !chi_json_get_number(chatgpt_json, "expires", &expires_num)) {
+    expires_num = 0;
+  }
+  expires_at_ms = expires_num > 0 ? (long long)expires_num : 0;
+
+  if (chi_is_blank(account_id) && !chi_is_blank(access_token)) {
+    free(account_id);
+    account_id = chi_extract_chatgpt_account_id(access_token);
+  }
+
+  if (!chi_set_chatgpt_auth_cache(
+          cfg, access_token, refresh_token, account_id, expires_at_ms, CHI_CHATGPT_AUTH_SOURCE_CHI_FILE)) {
+    *err_out = chi_strdup("failed to cache ~/.chi/auth.json credentials");
+    goto cleanup;
+  }
+
+cleanup:
+  free(auth_path);
+  free(auth_json);
+  free(chatgpt_json);
+  free(access_token);
+  free(refresh_token);
+  free(account_id);
+  return *err_out == NULL;
+}
+
+static int chi_load_legacy_codex_token(chi_config *cfg, int *found_out, char **err_out) {
+  char *auth_path = NULL;
+  char *auth_json = NULL;
+  char *tokens_json = NULL;
+  char *access_token = NULL;
+  char *account_id = NULL;
+  char *tmp_err = NULL;
+
+  *found_out = 0;
+  *err_out = NULL;
+
+  auth_path = chi_build_legacy_codex_auth_path(&tmp_err);
+  if (auth_path == NULL) {
+    *err_out = tmp_err;
+    return 0;
+  }
+
+  auth_json = chi_read_named_text_file(auth_path, "codex auth file", &tmp_err);
+  if (auth_json == NULL) {
+    if (tmp_err != NULL && strstr(tmp_err, "failed to open") != NULL) {
+      free(tmp_err);
+      free(auth_path);
+      return 1;
+    }
+    *err_out = tmp_err;
+    free(auth_path);
+    return 0;
+  }
+
+  *found_out = 1;
+  tokens_json = chi_json_get_object(auth_json, "tokens");
+  if (tokens_json == NULL) {
+    *err_out = chi_strdup("~/.codex/auth.json is missing the tokens object");
+    goto cleanup;
+  }
+
+  access_token = chi_json_get_string(tokens_json, "access_token");
+  account_id = chi_extract_chatgpt_account_id(access_token);
+  if (!chi_set_chatgpt_auth_cache(
+          cfg, access_token, NULL, account_id, 0, CHI_CHATGPT_AUTH_SOURCE_LEGACY_CODEX)) {
+    *err_out = chi_strdup("failed to cache ~/.codex/auth.json credentials");
+    goto cleanup;
+  }
+
+cleanup:
+  free(auth_path);
+  free(auth_json);
+  free(tokens_json);
+  free(access_token);
+  free(account_id);
+  return *err_out == NULL;
+}
+
+static int chi_refresh_chatgpt_auth_file(chi_config *cfg, char **err_out) {
+  char *access_token = NULL;
+  char *refresh_token = NULL;
+  char *account_id = NULL;
+  long long expires_at_ms = 0;
+  int ok = 0;
+
+  *err_out = NULL;
+  if (cfg == NULL || chi_is_blank(cfg->chatgpt_refresh_token)) {
+    *err_out = chi_strdup("chatgpt refresh token is not available");
+    return 0;
+  }
+
+  if (!chi_refresh_chatgpt_tokens(
+          cfg->chatgpt_refresh_token, &access_token, &refresh_token, &expires_at_ms, err_out)) {
+    return 0;
+  }
+
+  account_id = chi_extract_chatgpt_account_id(access_token);
+  if (chi_is_blank(account_id)) {
+    free(access_token);
+    free(refresh_token);
+    free(account_id);
+    *err_out = chi_strdup("failed to extract chatgpt account id from refreshed token");
+    return 0;
+  }
+
+  if (!chi_set_chatgpt_auth_cache(
+          cfg, access_token, refresh_token, account_id, expires_at_ms, CHI_CHATGPT_AUTH_SOURCE_CHI_FILE)) {
+    *err_out = chi_strdup("failed to cache refreshed chatgpt credentials");
+    goto cleanup;
+  }
+
+  ok = chi_save_chatgpt_auth_file(cfg, err_out);
+
+cleanup:
+  free(access_token);
+  free(refresh_token);
+  free(account_id);
+  return ok;
+}
+
+static int chi_login_chatgpt_interactive(chi_config *cfg, char **err_out) {
+  char state_hex[33];
+  char *verifier = NULL;
+  char *challenge = NULL;
+  char *url = NULL;
+  char *input = NULL;
+  char *code = NULL;
+  char *state = NULL;
+  char *access_token = NULL;
+  char *refresh_token = NULL;
+  char *account_id = NULL;
+  long long expires_at_ms = 0;
+  int ok = 0;
+
+  *err_out = NULL;
+  if (!chi_can_prompt_user()) {
+    *err_out = chi_strdup("interactive ChatGPT login requires a terminal");
+    return 0;
+  }
+
+  chi_random_hex(state_hex, sizeof(state_hex), 16);
+  if (state_hex[0] == '\0') {
+    *err_out = chi_strdup("failed to generate login state");
+    return 0;
+  }
+  if (!chi_build_chatgpt_pkce_pair(&verifier, &challenge, err_out)) {
+    return 0;
+  }
+  url = chi_build_chatgpt_authorize_url(challenge, state_hex, err_out);
+  if (url == NULL) {
+    goto cleanup;
+  }
+
+  fprintf(
+      stderr,
+      "ChatGPT login is required for the selected backend.\n"
+      "Opening your browser. After you finish signing in, the browser may land on a localhost URL that fails to "
+      "load; copy the full URL and paste it here.\n\n%s\n\n",
+      url);
+  chi_try_open_url(url);
+
+  input = chi_prompt_line("Paste the redirect URL or authorization code: ", err_out);
+  if (input == NULL) {
+    goto cleanup;
+  }
+  if (!chi_parse_chatgpt_authorization_input(input, &code, &state, err_out)) {
+    goto cleanup;
+  }
+  if (!chi_is_blank(state) && strcmp(state, state_hex) != 0) {
+    *err_out = chi_strdup("authorization state mismatch");
+    goto cleanup;
+  }
+
+  if (!chi_exchange_chatgpt_authorization_code(
+          code, verifier, &access_token, &refresh_token, &expires_at_ms, err_out)) {
+    goto cleanup;
+  }
+
+  account_id = chi_extract_chatgpt_account_id(access_token);
+  if (chi_is_blank(account_id)) {
+    *err_out = chi_strdup("failed to extract chatgpt account id from access token");
+    goto cleanup;
+  }
+
+  if (!chi_set_chatgpt_auth_cache(
+          cfg, access_token, refresh_token, account_id, expires_at_ms, CHI_CHATGPT_AUTH_SOURCE_CHI_FILE)) {
+    *err_out = chi_strdup("failed to cache chatgpt login credentials");
+    goto cleanup;
+  }
+
+  if (!chi_save_chatgpt_auth_file(cfg, err_out)) {
+    goto cleanup;
+  }
+
+  fprintf(stderr, "Saved ChatGPT credentials to ~/.chi/auth.json\n");
+  ok = 1;
+
+cleanup:
+  free(verifier);
+  free(challenge);
+  free(url);
+  free(input);
+  free(code);
+  free(state);
+  free(access_token);
+  free(refresh_token);
+  free(account_id);
+  return ok;
+}
+
+static int chi_resolve_chatgpt_auth(
+    chi_config *cfg,
+    char **token_out,
+    char **account_id_out,
+    char **err_out) {
+  const char *direct = getenv("CHATGPT_ACCESS_TOKEN");
+  char *account_id = NULL;
+  char *tmp_err = NULL;
+  int found = 0;
+
+  *token_out = NULL;
+  *account_id_out = NULL;
+  *err_out = NULL;
+
+  if (!chi_is_blank(cfg->chatgpt_access_token) && !chi_is_blank(cfg->chatgpt_account_id)) {
+    if (cfg->chatgpt_auth_source == CHI_CHATGPT_AUTH_SOURCE_CHI_FILE && !chi_is_blank(cfg->chatgpt_refresh_token) &&
+        cfg->chatgpt_expires_at_ms > 0 && chi_now_ms() + 60000 >= cfg->chatgpt_expires_at_ms) {
+      if (!chi_refresh_chatgpt_auth_file(cfg, &tmp_err)) {
+        if (!cfg->chatgpt_login_attempted && chi_can_prompt_user()) {
+          cfg->chatgpt_login_attempted = 1;
+          chi_clear_chatgpt_auth_cache(cfg);
+          free(tmp_err);
+          tmp_err = NULL;
+          if (!chi_login_chatgpt_interactive(cfg, &tmp_err)) {
+            *err_out = tmp_err;
+            return 0;
+          }
+        } else {
+          *err_out = tmp_err;
+          return 0;
+        }
+      }
+    }
+
+    *token_out = chi_strdup(cfg->chatgpt_access_token);
+    *account_id_out = chi_strdup(cfg->chatgpt_account_id);
+    if (*token_out == NULL || *account_id_out == NULL) {
+      free(*token_out);
+      free(*account_id_out);
+      *token_out = NULL;
+      *account_id_out = NULL;
+      *err_out = chi_strdup("out of memory while copying chatgpt auth");
+      return 0;
+    }
+    return 1;
+  }
+
+  if (!chi_is_blank(direct)) {
+    account_id = chi_extract_chatgpt_account_id(direct);
+    if (chi_is_blank(account_id)) {
+      free(account_id);
+      *err_out = chi_strdup("CHATGPT_ACCESS_TOKEN is set but does not contain a ChatGPT account id");
+      return 0;
+    }
+    if (!chi_set_chatgpt_auth_cache(cfg, direct, NULL, account_id, 0, CHI_CHATGPT_AUTH_SOURCE_ENV)) {
+      free(account_id);
+      *err_out = chi_strdup("failed to cache CHATGPT_ACCESS_TOKEN");
+      return 0;
+    }
+    free(account_id);
+    return chi_resolve_chatgpt_auth(cfg, token_out, account_id_out, err_out);
+  }
+
+  if (!chi_load_chatgpt_auth_file(cfg, &found, &tmp_err)) {
+    *err_out = tmp_err;
+    return 0;
+  }
+  if (found) {
+    return chi_resolve_chatgpt_auth(cfg, token_out, account_id_out, err_out);
+  }
+
+  if (!chi_load_legacy_codex_token(cfg, &found, &tmp_err)) {
+    *err_out = tmp_err;
+    return 0;
+  }
+  if (found) {
+    return chi_resolve_chatgpt_auth(cfg, token_out, account_id_out, err_out);
+  }
+
+  if (!cfg->chatgpt_login_attempted && chi_can_prompt_user()) {
+    cfg->chatgpt_login_attempted = 1;
+    if (!chi_login_chatgpt_interactive(cfg, &tmp_err)) {
+      *err_out = tmp_err;
+      return 0;
+    }
+    return chi_resolve_chatgpt_auth(cfg, token_out, account_id_out, err_out);
+  }
+
+  *err_out = chi_strdup(
+      "set CHATGPT_ACCESS_TOKEN, create ~/.chi/auth.json via an interactive login, or ensure ~/.codex/auth.json "
+      "contains tokens.access_token");
+  return 0;
+}
+
 static int chi_run_shell_command(const char *cwd, const char *command, double timeout_s, chi_shell_result *out) {
   int pipefd[2];
   pid_t pid;
@@ -2664,79 +3983,86 @@ static int chi_provider_openai(
       err_out);
 }
 
-static int chi_resolve_chatgpt_access_token(chi_config *cfg, char **token_out, char **err_out) {
-  const char *direct;
+static int chi_provider_request_chatgpt(
+    const chi_config *cfg,
+    const chi_conversation *conversation,
+    const char *access_token,
+    const char *account_id,
+    chi_action *action,
+    char **err_out) {
+  const char *url;
+  char *req_json = NULL;
+  char *resp_json = NULL;
   char *tmp_err = NULL;
-  char *auth_path = NULL;
-  char *auth_json = NULL;
-  char *tokens_json = NULL;
-  char *token = NULL;
-  const char *home;
+  char *auth = NULL;
+  char *account = NULL;
+  char *session = NULL;
+  const char *headers[7];
+  int http_code = 0;
+  int ok = 0;
 
-  *token_out = NULL;
   *err_out = NULL;
 
-  if (!chi_is_blank(cfg->chatgpt_access_token)) {
-    *token_out = chi_strdup(cfg->chatgpt_access_token);
-    return *token_out != NULL;
-  }
-
-  direct = getenv("CHATGPT_ACCESS_TOKEN");
-  if (!chi_is_blank(direct)) {
-    cfg->chatgpt_access_token = chi_strdup(direct);
-    *token_out = chi_strdup(direct);
-    return cfg->chatgpt_access_token != NULL && *token_out != NULL;
-  }
-
-  home = getenv("HOME");
-  if (chi_is_blank(home)) {
-    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
+  req_json = chi_build_request_json(cfg, conversation, &tmp_err);
+  if (req_json == NULL) {
+    *err_out = tmp_err;
     return 0;
   }
 
-  auth_path = chi_format("%s/.codex/auth.json", home);
-  if (auth_path == NULL) {
-    *err_out = chi_strdup("out of memory while building ~/.codex/auth.json path");
+  auth = chi_format("Authorization: Bearer %s", access_token);
+  account = chi_format("chatgpt-account-id: %s", account_id);
+  session = chi_format("session_id: %s", cfg->session_id);
+  if (auth == NULL || account == NULL || session == NULL) {
+    free(req_json);
+    free(auth);
+    free(account);
+    free(session);
+    *err_out = chi_strdup("out of memory while building chatgpt headers");
     return 0;
   }
 
-  auth_json = chi_read_named_text_file(auth_path, "codex auth file", &tmp_err);
-  if (auth_json == NULL) {
-    free(auth_path);
-    free(tmp_err);
-    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
+  headers[0] = auth;
+  headers[1] = account;
+  headers[2] = "originator: pi";
+  headers[3] = session;
+  headers[4] = "OpenAI-Beta: responses=experimental";
+  headers[5] = "Content-Type: application/json";
+  headers[6] = "Accept: text/event-stream";
+  url = getenv("CHATGPT_API_URL");
+  if (chi_is_blank(url)) {
+    url = "https://chatgpt.com/backend-api/codex/responses";
+  }
+
+  if (!chi_curl_request("POST", url, headers, 7, req_json, &resp_json, &http_code, &tmp_err)) {
+    *err_out = tmp_err == NULL ? chi_strdup("chatgpt provider request failed") : tmp_err;
+    free(req_json);
+    free(auth);
+    free(account);
+    free(session);
     return 0;
   }
 
-  tokens_json = chi_json_get_object(auth_json, "tokens");
-  if (tokens_json == NULL) {
-    free(auth_json);
-    free(auth_path);
-    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
+  if (http_code < 200 || http_code >= 300) {
+    *err_out = chi_format("chatgpt http %d: %s", http_code, resp_json);
+    free(req_json);
+    free(auth);
+    free(account);
+    free(session);
+    free(resp_json);
     return 0;
   }
 
-  token = chi_json_get_string(tokens_json, "access_token");
-  free(tokens_json);
-  free(auth_json);
-  free(auth_path);
-
-  if (chi_is_blank(token)) {
-    free(token);
-    *err_out = chi_strdup("set CHATGPT_ACCESS_TOKEN or ensure ~/.codex/auth.json contains tokens.access_token");
-    return 0;
+  ok = chi_extract_provider_action(resp_json, action, &tmp_err);
+  if (!ok) {
+    *err_out = tmp_err;
   }
 
-  cfg->chatgpt_access_token = chi_strdup(token);
-  *token_out = token;
-  if (cfg->chatgpt_access_token == NULL) {
-    free(*token_out);
-    *token_out = NULL;
-    *err_out = chi_strdup("out of memory while caching access token");
-    return 0;
-  }
-
-  return 1;
+  free(req_json);
+  free(auth);
+  free(account);
+  free(session);
+  free(resp_json);
+  return ok;
 }
 
 static int chi_provider_chatgpt(
@@ -2745,23 +4071,17 @@ static int chi_provider_chatgpt(
     chi_action *action,
     char **err_out) {
   char *token = NULL;
+  char *account_id = NULL;
   int ok;
 
   *err_out = NULL;
 
-  if (!chi_resolve_chatgpt_access_token(cfg, &token, err_out)) {
+  if (!chi_resolve_chatgpt_auth(cfg, &token, &account_id, err_out)) {
     return 0;
   }
-  ok = chi_provider_request_with_auth(
-      cfg,
-      conversation,
-      token,
-      "CHATGPT_API_URL",
-      "https://chatgpt.com/backend-api/codex/responses",
-      "chatgpt",
-      action,
-      err_out);
+  ok = chi_provider_request_chatgpt(cfg, conversation, token, account_id, action, err_out);
   free(token);
+  free(account_id);
   return ok;
 }
 
@@ -2896,7 +4216,7 @@ static void chi_usage(const char *argv0) {
           "\n"
           "env:\n"
           "  OPENAI_API_KEY               auth for openai backend when selected\n"
-          "  CHATGPT_ACCESS_TOKEN         direct auth for default chatgpt backend (else ~/.codex/auth.json)\n"
+          "  CHATGPT_ACCESS_TOKEN         direct auth for chatgpt backend (else ~/.chi/auth.json, then ~/.codex/auth.json)\n"
           "  CHI_BACKEND                  backend override (default: chatgpt; openai|chatgpt)\n"
           "  CHI_MODEL                    default model (default: gpt-5.4)\n"
           "  CHI_REASONING_EFFORT         default reasoning effort (default: high)\n"
@@ -3111,7 +4431,7 @@ int main(int argc, char **argv) {
       free(cfg.loaded_model);
       free(cfg.loaded_reasoning_effort);
       free(cfg.loaded_working_dir);
-      free(cfg.chatgpt_access_token);
+      chi_clear_chatgpt_auth_cache(&cfg);
       return 1;
     }
     call_seq = chi_conversation_max_generated_call_seq(&convo);
@@ -3131,7 +4451,7 @@ int main(int argc, char **argv) {
       free(cfg.loaded_model);
       free(cfg.loaded_reasoning_effort);
       free(cfg.loaded_working_dir);
-      free(cfg.chatgpt_access_token);
+      chi_clear_chatgpt_auth_cache(&cfg);
       return 2;
     }
   }
@@ -3145,7 +4465,7 @@ int main(int argc, char **argv) {
     free(cfg.loaded_model);
     free(cfg.loaded_reasoning_effort);
     free(cfg.loaded_working_dir);
-    free(cfg.chatgpt_access_token);
+    chi_clear_chatgpt_auth_cache(&cfg);
     return 1;
   }
 
@@ -3369,6 +4689,6 @@ cleanup:
   free(cfg.loaded_model);
   free(cfg.loaded_reasoning_effort);
   free(cfg.loaded_working_dir);
-  free(cfg.chatgpt_access_token);
+  chi_clear_chatgpt_auth_cache(&cfg);
   return exit_code;
 }

@@ -35,7 +35,7 @@ Use `--system-prompt-file` (or `CHI_SYSTEM_PROMPT_FILE`) to load a custom system
   .
 ```
 
-By default `chi` uses the `chatgpt` backend and will read `CHATGPT_ACCESS_TOKEN` or fall back to `~/.codex/auth.json` `tokens.access_token`. Use `CHI_BACKEND=openai` or `--backend openai` when you want the OpenAI API path with `OPENAI_API_KEY`. `chi` requires `libcurl` at build/runtime.
+By default `chi` uses the `chatgpt` backend. It resolves ChatGPT auth in this order: `CHATGPT_ACCESS_TOKEN`, `~/.chi/auth.json`, then `~/.codex/auth.json` `tokens.access_token`. If no usable credentials are found, `chi` prompts for a browser-based ChatGPT login and saves refreshable credentials in `~/.chi/auth.json`. Use `CHI_BACKEND=openai` or `--backend openai` when you want the OpenAI API path with `OPENAI_API_KEY`. `chi` requires `libcurl` at build/runtime.
 
 Every completed model response now prints the session id after `[final]`.
 `chi` stores session state in `.chi-sessions/` by default, or `CHI_SESSION_DIR` if set.
@@ -59,7 +59,8 @@ You can combine that with the existing queueing support:
 
 ## Backends And Auth
 
-- `chatgpt` backend (default): uses `CHATGPT_ACCESS_TOKEN` when set, otherwise falls back to `~/.codex/auth.json` `tokens.access_token`
+- `chatgpt` backend (default): resolution order is `CHATGPT_ACCESS_TOKEN`, then `~/.chi/auth.json`, then `~/.codex/auth.json`
+- if no usable ChatGPT credentials are found and `chi` has a terminal, it opens a browser login flow and saves `access_token`, `refresh_token`, `account_id`, and expiry in `~/.chi/auth.json`
 - `openai` backend: set `OPENAI_API_KEY` and pass `--backend openai` or `CHI_BACKEND=openai`
 - optional network tuning:
   - `CHI_MODEL` (same as passing `--model`, default `gpt-5.4`)
