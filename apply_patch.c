@@ -838,6 +838,169 @@ static int ap_parse_update_chunk(
   return 1;
 }
 
+static int ap_parse_add_hunk(
+    const ap_strvec *lines,
+    size_t *idx,
+    int *line_number,
+    char *path,
+    ap_hunkvec *hunks_out,
+    char **err_out) {
+  ap_hunk hunk;
+
+  memset(&hunk, 0, sizeof(hunk));
+  hunk.type = AP_HUNK_ADD;
+  hunk.path = path;
+  hunk.line_number = *line_number;
+
+  (*idx)++;
+  (*line_number)++;
+
+  while (*idx + 1 < lines->count && lines->items[*idx][0] == '+') {
+    if (!ap_strvec_push(&hunk.add_lines, lines->items[*idx] + 1)) {
+      *err_out = ap_strdup("out of memory parsing patch");
+      ap_hunk_free(&hunk);
+      return 0;
+    }
+
+    (*idx)++;
+    (*line_number)++;
+  }
+
+  if (!ap_hunkvec_push_owned(hunks_out, &hunk)) {
+    *err_out = ap_strdup("out of memory parsing patch");
+    ap_hunk_free(&hunk);
+    return 0;
+  }
+
+  return 1;
+}
+
+static int ap_parse_delete_hunk(
+    size_t *idx,
+    int *line_number,
+    char *path,
+    ap_hunkvec *hunks_out,
+    char **err_out) {
+  ap_hunk hunk;
+
+  memset(&hunk, 0, sizeof(hunk));
+  hunk.type = AP_HUNK_DELETE;
+  hunk.path = path;
+  hunk.line_number = *line_number;
+
+  (*idx)++;
+  (*line_number)++;
+
+  if (!ap_hunkvec_push_owned(hunks_out, &hunk)) {
+    *err_out = ap_strdup("out of memory parsing patch");
+    ap_hunk_free(&hunk);
+    return 0;
+  }
+
+  return 1;
+}
+
+static int ap_parse_update_hunk(
+    const ap_strvec *lines,
+    size_t *idx,
+    int *line_number,
+    char *path,
+    ap_hunkvec *hunks_out,
+    char **err_out) {
+  ap_hunk hunk;
+
+  memset(&hunk, 0, sizeof(hunk));
+  hunk.type = AP_HUNK_UPDATE;
+  hunk.path = path;
+  hunk.line_number = *line_number;
+
+  (*idx)++;
+  (*line_number)++;
+
+  if (*idx + 1 < lines->count) {
+    char *move_to = ap_trimmed_substring_after(lines->items[*idx], AP_MOVE_TO);
+    if (move_to != NULL) {
+      hunk.move_to = move_to;
+      (*idx)++;
+      (*line_number)++;
+    }
+  }
+
+  while (*idx + 1 < lines->count) {
+    ap_update_chunk chunk;
+    size_t consumed = 0;
+
+    if (ap_is_blank(lines->items[*idx])) {
+      (*idx)++;
+      (*line_number)++;
+      continue;
+    }
+
+    if (ap_trimmed_equals(lines->items[*idx], AP_END_PATCH) ||
+        ap_trimmed_starts_with(lines->items[*idx], AP_ADD_FILE) ||
+        ap_trimmed_starts_with(lines->items[*idx], AP_DELETE_FILE) ||
+        ap_trimmed_starts_with(lines->items[*idx], AP_UPDATE_FILE)) {
+      break;
+    }
+
+    memset(&chunk, 0, sizeof(chunk));
+    if (!ap_parse_update_chunk(lines, *idx, hunk.chunk_count == 0, *line_number, &chunk, &consumed, err_out)) {
+      ap_hunk_free(&hunk);
+      return 0;
+    }
+
+    if (!ap_ensure_cap((void **)&hunk.chunks, &hunk.chunk_cap, hunk.chunk_count + 1, sizeof(ap_update_chunk))) {
+      *err_out = ap_strdup("out of memory parsing patch");
+      ap_update_chunk_free(&chunk);
+      ap_hunk_free(&hunk);
+      return 0;
+    }
+
+    hunk.chunks[hunk.chunk_count++] = chunk;
+    *idx += consumed;
+    *line_number += (int)consumed;
+  }
+
+  if (hunk.chunk_count == 0) {
+    *err_out = ap_format(
+        "Invalid patch hunk on line %d: Update file hunk for path '%s' is empty",
+        hunk.line_number,
+        hunk.path == NULL ? "" : hunk.path);
+    ap_hunk_free(&hunk);
+    return 0;
+  }
+
+  if (!ap_hunkvec_push_owned(hunks_out, &hunk)) {
+    *err_out = ap_strdup("out of memory parsing patch");
+    ap_hunk_free(&hunk);
+    return 0;
+  }
+
+  return 1;
+}
+
+static int ap_fail_invalid_hunk_header(const char *line, int line_number, char **err_out) {
+  const char *trim_start;
+  size_t trim_len;
+  char *first_line;
+
+  ap_trim_view(line, &trim_start, &trim_len);
+  first_line = (char *)malloc(trim_len + 1);
+  if (first_line == NULL) {
+    *err_out = ap_strdup("out of memory parsing patch");
+    return 0;
+  }
+
+  memcpy(first_line, trim_start, trim_len);
+  first_line[trim_len] = '\0';
+  *err_out = ap_format(
+      "Invalid patch hunk on line %d: '%s' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'",
+      line_number,
+      first_line);
+  free(first_line);
+  return 0;
+}
+
 static int ap_parse_patch(const char *patch, ap_hunkvec *hunks_out, char **err_out) {
   char *trimmed = NULL;
   ap_strvec lines;
@@ -876,12 +1039,8 @@ static int ap_parse_patch(const char *patch, ap_hunkvec *hunks_out, char **err_o
   line_number = 2;
 
   while (idx + 1 < lines.count) {
-    ap_hunk hunk;
     char *path = NULL;
     const char *line = lines.items[idx];
-
-    memset(&hunk, 0, sizeof(hunk));
-    hunk.line_number = line_number;
 
     if (ap_is_blank(line)) {
       idx++;
@@ -891,25 +1050,7 @@ static int ap_parse_patch(const char *patch, ap_hunkvec *hunks_out, char **err_o
 
     path = ap_trimmed_substring_after(line, AP_ADD_FILE);
     if (path != NULL) {
-      hunk.type = AP_HUNK_ADD;
-      hunk.path = path;
-      idx++;
-      line_number++;
-
-      while (idx + 1 < lines.count && lines.items[idx][0] == '+') {
-        if (!ap_strvec_push(&hunk.add_lines, lines.items[idx] + 1)) {
-          *err_out = ap_strdup("out of memory parsing patch");
-          ap_hunk_free(&hunk);
-          ap_strvec_free(&lines);
-          return 0;
-        }
-        idx++;
-        line_number++;
-      }
-
-      if (!ap_hunkvec_push_owned(hunks_out, &hunk)) {
-        *err_out = ap_strdup("out of memory parsing patch");
-        ap_hunk_free(&hunk);
+      if (!ap_parse_add_hunk(&lines, &idx, &line_number, path, hunks_out, err_out)) {
         ap_strvec_free(&lines);
         return 0;
       }
@@ -918,14 +1059,7 @@ static int ap_parse_patch(const char *patch, ap_hunkvec *hunks_out, char **err_o
 
     path = ap_trimmed_substring_after(line, AP_DELETE_FILE);
     if (path != NULL) {
-      hunk.type = AP_HUNK_DELETE;
-      hunk.path = path;
-      idx++;
-      line_number++;
-
-      if (!ap_hunkvec_push_owned(hunks_out, &hunk)) {
-        *err_out = ap_strdup("out of memory parsing patch");
-        ap_hunk_free(&hunk);
+      if (!ap_parse_delete_hunk(&idx, &line_number, path, hunks_out, err_out)) {
         ap_strvec_free(&lines);
         return 0;
       }
@@ -934,95 +1068,14 @@ static int ap_parse_patch(const char *patch, ap_hunkvec *hunks_out, char **err_o
 
     path = ap_trimmed_substring_after(line, AP_UPDATE_FILE);
     if (path != NULL) {
-      hunk.type = AP_HUNK_UPDATE;
-      hunk.path = path;
-      idx++;
-      line_number++;
-
-      if (idx + 1 < lines.count) {
-        char *move_to = ap_trimmed_substring_after(lines.items[idx], AP_MOVE_TO);
-        if (move_to != NULL) {
-          hunk.move_to = move_to;
-          idx++;
-          line_number++;
-        }
-      }
-
-      while (idx + 1 < lines.count) {
-        ap_update_chunk chunk;
-        size_t consumed = 0;
-
-        if (ap_is_blank(lines.items[idx])) {
-          idx++;
-          line_number++;
-          continue;
-        }
-
-        if (ap_trimmed_equals(lines.items[idx], AP_END_PATCH) ||
-            ap_trimmed_starts_with(lines.items[idx], AP_ADD_FILE) ||
-            ap_trimmed_starts_with(lines.items[idx], AP_DELETE_FILE) ||
-            ap_trimmed_starts_with(lines.items[idx], AP_UPDATE_FILE)) {
-          break;
-        }
-
-        memset(&chunk, 0, sizeof(chunk));
-        if (!ap_parse_update_chunk(&lines, idx, hunk.chunk_count == 0, line_number, &chunk, &consumed, err_out)) {
-          ap_hunk_free(&hunk);
-          ap_strvec_free(&lines);
-          return 0;
-        }
-
-        if (!ap_ensure_cap((void **)&hunk.chunks, &hunk.chunk_cap, hunk.chunk_count + 1, sizeof(ap_update_chunk))) {
-          *err_out = ap_strdup("out of memory parsing patch");
-          ap_update_chunk_free(&chunk);
-          ap_hunk_free(&hunk);
-          ap_strvec_free(&lines);
-          return 0;
-        }
-
-        hunk.chunks[hunk.chunk_count++] = chunk;
-        idx += consumed;
-        line_number += (int)consumed;
-      }
-
-      if (hunk.chunk_count == 0) {
-        *err_out = ap_format(
-            "Invalid patch hunk on line %d: Update file hunk for path '%s' is empty",
-            hunk.line_number,
-            hunk.path == NULL ? "" : hunk.path);
-        ap_hunk_free(&hunk);
-        ap_strvec_free(&lines);
-        return 0;
-      }
-
-      if (!ap_hunkvec_push_owned(hunks_out, &hunk)) {
-        *err_out = ap_strdup("out of memory parsing patch");
-        ap_hunk_free(&hunk);
+      if (!ap_parse_update_hunk(&lines, &idx, &line_number, path, hunks_out, err_out)) {
         ap_strvec_free(&lines);
         return 0;
       }
       continue;
     }
 
-    {
-      const char *trim_start;
-      size_t trim_len;
-      char *first_line;
-
-      ap_trim_view(line, &trim_start, &trim_len);
-      first_line = (char *)malloc(trim_len + 1);
-      if (first_line == NULL) {
-        *err_out = ap_strdup("out of memory parsing patch");
-        ap_strvec_free(&lines);
-        return 0;
-      }
-      memcpy(first_line, trim_start, trim_len);
-      first_line[trim_len] = '\0';
-      *err_out = ap_format(
-          "Invalid patch hunk on line %d: '%s' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'",
-          line_number,
-          first_line);
-      free(first_line);
+    if (!ap_fail_invalid_hunk_header(line, line_number, err_out)) {
       ap_strvec_free(&lines);
       return 0;
     }
@@ -1654,6 +1707,149 @@ static int ap_load_effective_content(
   return ap_read_file(path, content_out, err_out);
 }
 
+static int ap_plan_push_add(
+    ap_planvec *plan,
+    ap_virtualfs *vfs,
+    const ap_hunk *h,
+    char *src_abs,
+    char **err_out) {
+  ap_plan_op op;
+  char *content = NULL;
+
+  memset(&op, 0, sizeof(op));
+
+  if (!ap_join_lines_with_trailing_newline(&h->add_lines, &content)) {
+    free(src_abs);
+    *err_out = ap_strdup("out of memory preparing add file content");
+    return 0;
+  }
+
+  op.kind = AP_PLAN_ADD;
+  op.src_abs = src_abs;
+  op.dest_abs = ap_strdup(src_abs);
+  op.display_path = ap_strdup(h->path);
+  op.new_content = content;
+  if (op.dest_abs == NULL || op.display_path == NULL) {
+    ap_plan_op_free(&op);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  if (!ap_virtualfs_set(vfs, src_abs, 1, content) || !ap_planvec_push_owned(plan, &op)) {
+    ap_plan_op_free(&op);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  return 1;
+}
+
+static int ap_plan_push_delete(
+    ap_planvec *plan,
+    ap_virtualfs *vfs,
+    const ap_hunk *h,
+    char *src_abs,
+    char **err_out) {
+  ap_plan_op op;
+  char *existing = NULL;
+
+  memset(&op, 0, sizeof(op));
+
+  if (!ap_load_effective_content(vfs, src_abs, &existing, err_out)) {
+    free(src_abs);
+    return 0;
+  }
+  free(existing);
+
+  op.kind = AP_PLAN_DELETE;
+  op.src_abs = src_abs;
+  op.display_path = ap_strdup(h->path);
+  if (op.display_path == NULL) {
+    ap_plan_op_free(&op);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  if (!ap_virtualfs_set(vfs, src_abs, 0, NULL) || !ap_planvec_push_owned(plan, &op)) {
+    ap_plan_op_free(&op);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  return 1;
+}
+
+static int ap_plan_push_update(
+    const char *cwd,
+    ap_planvec *plan,
+    ap_virtualfs *vfs,
+    const ap_hunk *h,
+    char *src_abs,
+    char **err_out) {
+  ap_plan_op op;
+  char *source_content = NULL;
+  char *new_content = NULL;
+  char *dest_abs = NULL;
+  char *display = NULL;
+
+  memset(&op, 0, sizeof(op));
+
+  if (!ap_load_effective_content(vfs, src_abs, &source_content, err_out)) {
+    free(src_abs);
+    return 0;
+  }
+
+  if (!ap_compute_updated_content(src_abs, source_content, h->chunks, h->chunk_count, &new_content, err_out)) {
+    free(source_content);
+    free(src_abs);
+    return 0;
+  }
+  free(source_content);
+
+  dest_abs = h->move_to != NULL ? ap_resolve_path(cwd, h->move_to) : ap_strdup(src_abs);
+  if (dest_abs == NULL) {
+    free(new_content);
+    free(src_abs);
+    *err_out = ap_strdup("out of memory resolving move path");
+    return 0;
+  }
+
+  display = ap_strdup(h->move_to != NULL ? h->move_to : h->path);
+  if (display == NULL) {
+    free(dest_abs);
+    free(new_content);
+    free(src_abs);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  op.kind = AP_PLAN_UPDATE;
+  op.src_abs = src_abs;
+  op.dest_abs = dest_abs;
+  op.display_path = display;
+  op.new_content = new_content;
+
+  if (!ap_virtualfs_set(vfs, dest_abs, 1, new_content)) {
+    ap_plan_op_free(&op);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  if (!ap_streq(src_abs, dest_abs) && !ap_virtualfs_set(vfs, src_abs, 0, NULL)) {
+    ap_plan_op_free(&op);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  if (!ap_planvec_push_owned(plan, &op)) {
+    ap_plan_op_free(&op);
+    *err_out = ap_strdup("out of memory preparing patch plan");
+    return 0;
+  }
+
+  return 1;
+}
+
 static int ap_build_plan(
     const char *cwd,
     const ap_hunkvec *hunks,
@@ -1672,10 +1868,7 @@ static int ap_build_plan(
 
   for (i = 0; i < hunks->count; i++) {
     const ap_hunk *h = &hunks->items[i];
-    ap_plan_op op;
     char *src_abs = NULL;
-
-    memset(&op, 0, sizeof(op));
 
     src_abs = ap_resolve_path(cwd, h->path);
     if (src_abs == NULL) {
@@ -1685,38 +1878,7 @@ static int ap_build_plan(
     }
 
     if (h->type == AP_HUNK_ADD) {
-      char *content = NULL;
-
-      if (!ap_join_lines_with_trailing_newline(&h->add_lines, &content)) {
-        free(src_abs);
-        *err_out = ap_strdup("out of memory preparing add file content");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      op.kind = AP_PLAN_ADD;
-      op.src_abs = src_abs;
-      op.dest_abs = ap_strdup(src_abs);
-      op.display_path = ap_strdup(h->path);
-      op.new_content = content;
-
-      if (op.dest_abs == NULL || op.display_path == NULL) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      if (!ap_virtualfs_set(&vfs, src_abs, 1, content)) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      if (!ap_planvec_push_owned(plan, &op)) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
+      if (!ap_plan_push_add(plan, &vfs, h, src_abs, err_out)) {
         ap_virtualfs_free(&vfs);
         return 0;
       }
@@ -1724,35 +1886,7 @@ static int ap_build_plan(
     }
 
     if (h->type == AP_HUNK_DELETE) {
-      char *existing = NULL;
-
-      if (!ap_load_effective_content(&vfs, src_abs, &existing, err_out)) {
-        free(src_abs);
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-      free(existing);
-
-      op.kind = AP_PLAN_DELETE;
-      op.src_abs = src_abs;
-      op.display_path = ap_strdup(h->path);
-      if (op.display_path == NULL) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      if (!ap_virtualfs_set(&vfs, src_abs, 0, NULL)) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      if (!ap_planvec_push_owned(plan, &op)) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
+      if (!ap_plan_push_delete(plan, &vfs, h, src_abs, err_out)) {
         ap_virtualfs_free(&vfs);
         return 0;
       }
@@ -1760,72 +1894,7 @@ static int ap_build_plan(
     }
 
     if (h->type == AP_HUNK_UPDATE) {
-      char *source_content = NULL;
-      char *new_content = NULL;
-      char *dest_abs = NULL;
-      char *display = NULL;
-
-      if (!ap_load_effective_content(&vfs, src_abs, &source_content, err_out)) {
-        free(src_abs);
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      if (!ap_compute_updated_content(src_abs, source_content, h->chunks, h->chunk_count, &new_content, err_out)) {
-        free(source_content);
-        free(src_abs);
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-      free(source_content);
-
-      if (h->move_to != NULL) {
-        dest_abs = ap_resolve_path(cwd, h->move_to);
-      } else {
-        dest_abs = ap_strdup(src_abs);
-      }
-      if (dest_abs == NULL) {
-        free(new_content);
-        free(src_abs);
-        *err_out = ap_strdup("out of memory resolving move path");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      display = ap_strdup(h->move_to != NULL ? h->move_to : h->path);
-      if (display == NULL) {
-        free(dest_abs);
-        free(new_content);
-        free(src_abs);
-        *err_out = ap_strdup("out of memory preparing patch plan");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-
-      op.kind = AP_PLAN_UPDATE;
-      op.src_abs = src_abs;
-      op.dest_abs = dest_abs;
-      op.display_path = display;
-      op.new_content = new_content;
-
-      if (!ap_virtualfs_set(&vfs, dest_abs, 1, new_content)) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
-        ap_virtualfs_free(&vfs);
-        return 0;
-      }
-      if (!ap_streq(src_abs, dest_abs)) {
-        if (!ap_virtualfs_set(&vfs, src_abs, 0, NULL)) {
-          ap_plan_op_free(&op);
-          *err_out = ap_strdup("out of memory preparing patch plan");
-          ap_virtualfs_free(&vfs);
-          return 0;
-        }
-      }
-
-      if (!ap_planvec_push_owned(plan, &op)) {
-        ap_plan_op_free(&op);
-        *err_out = ap_strdup("out of memory preparing patch plan");
+      if (!ap_plan_push_update(cwd, plan, &vfs, h, src_abs, err_out)) {
         ap_virtualfs_free(&vfs);
         return 0;
       }
@@ -1842,6 +1911,46 @@ static int ap_build_plan(
   return 1;
 }
 
+static int ap_execute_add(const ap_plan_op *op, ap_undovec *undo, char **err_out) {
+  return ap_capture_preimage(op->dest_abs, undo, err_out) &&
+         ap_write_file_atomic(op->dest_abs, op->new_content, err_out);
+}
+
+static int ap_execute_delete(const ap_plan_op *op, ap_undovec *undo, char **err_out) {
+  if (!ap_capture_preimage(op->src_abs, undo, err_out)) {
+    return 0;
+  }
+
+  if (unlink(op->src_abs) == 0) {
+    return 1;
+  }
+
+  *err_out = ap_format("Failed to delete file %s: %s", op->src_abs, strerror(errno));
+  return 0;
+}
+
+static int ap_execute_update(const ap_plan_op *op, ap_undovec *undo, char **err_out) {
+  if (!ap_capture_preimage(op->dest_abs, undo, err_out) ||
+      !ap_write_file_atomic(op->dest_abs, op->new_content, err_out)) {
+    return 0;
+  }
+
+  if (ap_streq(op->src_abs, op->dest_abs)) {
+    return 1;
+  }
+
+  if (!ap_capture_preimage(op->src_abs, undo, err_out)) {
+    return 0;
+  }
+
+  if (unlink(op->src_abs) == 0) {
+    return 1;
+  }
+
+  *err_out = ap_format("Failed to remove original %s: %s", op->src_abs, strerror(errno));
+  return 0;
+}
+
 static int ap_execute_plan(const ap_planvec *plan, char **err_out) {
   ap_undovec undo;
   size_t i;
@@ -1851,62 +1960,20 @@ static int ap_execute_plan(const ap_planvec *plan, char **err_out) {
 
   for (i = 0; i < plan->count; i++) {
     const ap_plan_op *op = &plan->items[i];
+    int ok = 0;
 
     if (op->kind == AP_PLAN_ADD) {
-      if (!ap_capture_preimage(op->dest_abs, &undo, err_out)) {
-        ap_rollback(&undo);
-        ap_undovec_free(&undo);
-        return 0;
-      }
-      if (!ap_write_file_atomic(op->dest_abs, op->new_content, err_out)) {
-        ap_rollback(&undo);
-        ap_undovec_free(&undo);
-        return 0;
-      }
-      continue;
+      ok = ap_execute_add(op, &undo, err_out);
+    } else if (op->kind == AP_PLAN_DELETE) {
+      ok = ap_execute_delete(op, &undo, err_out);
+    } else if (op->kind == AP_PLAN_UPDATE) {
+      ok = ap_execute_update(op, &undo, err_out);
     }
 
-    if (op->kind == AP_PLAN_DELETE) {
-      if (!ap_capture_preimage(op->src_abs, &undo, err_out)) {
-        ap_rollback(&undo);
-        ap_undovec_free(&undo);
-        return 0;
-      }
-      if (unlink(op->src_abs) != 0) {
-        *err_out = ap_format("Failed to delete file %s: %s", op->src_abs, strerror(errno));
-        ap_rollback(&undo);
-        ap_undovec_free(&undo);
-        return 0;
-      }
-      continue;
-    }
-
-    if (op->kind == AP_PLAN_UPDATE) {
-      if (!ap_capture_preimage(op->dest_abs, &undo, err_out)) {
-        ap_rollback(&undo);
-        ap_undovec_free(&undo);
-        return 0;
-      }
-      if (!ap_write_file_atomic(op->dest_abs, op->new_content, err_out)) {
-        ap_rollback(&undo);
-        ap_undovec_free(&undo);
-        return 0;
-      }
-
-      if (!ap_streq(op->src_abs, op->dest_abs)) {
-        if (!ap_capture_preimage(op->src_abs, &undo, err_out)) {
-          ap_rollback(&undo);
-          ap_undovec_free(&undo);
-          return 0;
-        }
-        if (unlink(op->src_abs) != 0) {
-          *err_out = ap_format("Failed to remove original %s: %s", op->src_abs, strerror(errno));
-          ap_rollback(&undo);
-          ap_undovec_free(&undo);
-          return 0;
-        }
-      }
-      continue;
+    if (!ok) {
+      ap_rollback(&undo);
+      ap_undovec_free(&undo);
+      return 0;
     }
   }
 

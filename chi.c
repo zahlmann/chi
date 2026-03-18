@@ -1075,6 +1075,139 @@ done:
   return ok;
 }
 
+static int chi_close_session_file(FILE *fp, const char *path, char **err_out) {
+  if (fclose(fp) == 0) {
+    return 1;
+  }
+
+  *err_out = chi_format("failed to close session file '%s': %s", path, strerror(errno));
+  return 0;
+}
+
+static void chi_session_free_meta_fields(
+    char *stored_id,
+    char *backend,
+    char *model,
+    char *reasoning,
+    char *working_dir,
+    char *system_prompt) {
+  free(stored_id);
+  free(backend);
+  free(model);
+  free(reasoning);
+  free(working_dir);
+  free(system_prompt);
+}
+
+static int chi_session_apply_meta_record(
+    chi_config *cfg,
+    const char *line,
+    const char *session_id,
+    int keep_backend,
+    int keep_model,
+    int keep_reasoning,
+    int keep_system_prompt,
+    int keep_working_dir,
+    char **err_out) {
+  char *stored_id = chi_json_get_string(line, "session_id");
+  char *backend = chi_json_get_string(line, "backend");
+  char *model = chi_json_get_string(line, "model");
+  char *reasoning = chi_json_get_string(line, "reasoning_effort");
+  char *working_dir = chi_json_get_string(line, "working_dir");
+  char *system_prompt = chi_json_get_string(line, "system_prompt_text");
+
+  if (stored_id == NULL || strcmp(stored_id, session_id) != 0) {
+    *err_out = chi_format("session file '%s' does not match session id '%s'", cfg->session_path, session_id);
+    chi_session_free_meta_fields(stored_id, backend, model, reasoning, working_dir, system_prompt);
+    return 0;
+  }
+
+  if (!keep_backend && !chi_is_blank(backend) && !chi_parse_backend(backend, &cfg->backend)) {
+    *err_out = chi_format("session '%s' contains unsupported backend '%s'", session_id, backend);
+    chi_session_free_meta_fields(stored_id, backend, model, reasoning, working_dir, system_prompt);
+    return 0;
+  }
+
+  if (!keep_model && !chi_is_blank(model)) {
+    free(cfg->loaded_model);
+    cfg->loaded_model = model;
+    cfg->model = cfg->loaded_model;
+    model = NULL;
+  }
+
+  if (!keep_reasoning && !chi_is_blank(reasoning)) {
+    free(cfg->loaded_reasoning_effort);
+    cfg->loaded_reasoning_effort = reasoning;
+    cfg->reasoning_effort = cfg->loaded_reasoning_effort;
+    reasoning = NULL;
+  }
+
+  if (!keep_working_dir && !chi_is_blank(working_dir)) {
+    free(cfg->loaded_working_dir);
+    cfg->loaded_working_dir = working_dir;
+    cfg->working_dir = cfg->loaded_working_dir;
+    working_dir = NULL;
+  }
+
+  if (!keep_system_prompt && !chi_is_blank(system_prompt)) {
+    free(cfg->system_prompt_text);
+    cfg->system_prompt_text = system_prompt;
+    system_prompt = NULL;
+  }
+
+  chi_session_free_meta_fields(stored_id, backend, model, reasoning, working_dir, system_prompt);
+  return 1;
+}
+
+static int chi_session_add_message_record(
+    chi_conversation *conversation,
+    const char *line,
+    const char *session_path,
+    char **err_out) {
+  char *role = chi_json_get_string(line, "role");
+  char *text = chi_json_get_string(line, "text");
+  char *tool_call_id = chi_json_get_string(line, "tool_call_id");
+  char *tool_name = chi_json_get_string(line, "tool_name");
+  char *arguments_json = chi_json_get_string(line, "arguments_json");
+  double tool_is_custom_num = 0;
+  int tool_is_custom = chi_json_get_number(line, "tool_is_custom", &tool_is_custom_num) && tool_is_custom_num > 0;
+  char *tool_call_id_opt = NULL;
+  char *tool_name_opt = NULL;
+  char *arguments_json_opt = NULL;
+  int ok = 0;
+
+  if (role == NULL || text == NULL) {
+    *err_out = chi_format("invalid session message in '%s'", session_path);
+    goto cleanup;
+  }
+
+  tool_call_id_opt = chi_strdup_nonblank_or_null(tool_call_id);
+  tool_name_opt = chi_strdup_nonblank_or_null(tool_name);
+  arguments_json_opt = chi_strdup_nonblank_or_null(arguments_json);
+
+  if ((tool_call_id_opt == NULL && !chi_is_blank(tool_call_id)) ||
+      (tool_name_opt == NULL && !chi_is_blank(tool_name)) ||
+      (arguments_json_opt == NULL && !chi_is_blank(arguments_json)) ||
+      !chi_conversation_add(
+          conversation, role, text, tool_call_id_opt, tool_name_opt, arguments_json_opt, tool_is_custom)) {
+    *err_out = chi_strdup("failed to restore session message");
+    goto cleanup;
+  }
+
+  ok = 1;
+
+cleanup:
+  free(role);
+  free(text);
+  free(tool_call_id);
+  free(tool_name);
+  free(arguments_json);
+  free(tool_call_id_opt);
+  free(tool_name_opt);
+  free(arguments_json_opt);
+  return ok;
+}
+
 static int chi_session_save(const chi_config *cfg, const chi_conversation *conversation, char **err_out) {
   FILE *fp = NULL;
   size_t i;
@@ -1110,12 +1243,7 @@ static int chi_session_save(const chi_config *cfg, const chi_conversation *conve
     }
   }
 
-  if (fclose(fp) != 0) {
-    *err_out = chi_format("failed to close session file '%s': %s", cfg->session_path, strerror(errno));
-    return 0;
-  }
-
-  return 1;
+  return chi_close_session_file(fp, cfg->session_path, err_out);
 }
 
 static int chi_session_load(
@@ -1159,133 +1287,34 @@ static int chi_session_load(
     type = chi_json_get_string(line, "type");
     if (type == NULL) {
       *err_out = chi_format("invalid session record in '%s'", cfg->session_path);
-      free(type);
       goto fail;
     }
 
     if (strcmp(type, "meta") == 0) {
-      char *stored_id = chi_json_get_string(line, "session_id");
-      char *backend = chi_json_get_string(line, "backend");
-      char *model = chi_json_get_string(line, "model");
-      char *reasoning = chi_json_get_string(line, "reasoning_effort");
-      char *working_dir = chi_json_get_string(line, "working_dir");
-      char *system_prompt = chi_json_get_string(line, "system_prompt_text");
-
-      if (stored_id == NULL || strcmp(stored_id, session_id) != 0) {
-        *err_out = chi_format("session file '%s' does not match session id '%s'", cfg->session_path, session_id);
-        free(stored_id);
-        free(backend);
-        free(model);
-        free(reasoning);
-        free(working_dir);
-        free(system_prompt);
+      if (!chi_session_apply_meta_record(
+              cfg,
+              line,
+              session_id,
+              keep_backend,
+              keep_model,
+              keep_reasoning,
+              keep_system_prompt,
+              keep_working_dir,
+              err_out)) {
         free(type);
         goto fail;
-      }
-
-      if (!keep_backend && !chi_is_blank(backend) && !chi_parse_backend(backend, &cfg->backend)) {
-        *err_out = chi_format("session '%s' contains unsupported backend '%s'", session_id, backend);
-        free(stored_id);
-        free(backend);
-        free(model);
-        free(reasoning);
-        free(working_dir);
-        free(system_prompt);
-        free(type);
-        goto fail;
-      }
-
-      if (!keep_model && !chi_is_blank(model)) {
-        free(cfg->loaded_model);
-        cfg->loaded_model = model;
-        cfg->model = cfg->loaded_model;
-        model = NULL;
-      }
-
-      if (!keep_reasoning && !chi_is_blank(reasoning)) {
-        free(cfg->loaded_reasoning_effort);
-        cfg->loaded_reasoning_effort = reasoning;
-        cfg->reasoning_effort = cfg->loaded_reasoning_effort;
-        reasoning = NULL;
-      }
-
-      if (!keep_working_dir && !chi_is_blank(working_dir)) {
-        free(cfg->loaded_working_dir);
-        cfg->loaded_working_dir = working_dir;
-        cfg->working_dir = cfg->loaded_working_dir;
-        working_dir = NULL;
-      }
-
-      if (!keep_system_prompt && !chi_is_blank(system_prompt)) {
-        free(cfg->system_prompt_text);
-        cfg->system_prompt_text = system_prompt;
-        system_prompt = NULL;
       }
 
       saw_meta = 1;
-      free(stored_id);
-      free(backend);
-      free(model);
-      free(reasoning);
-      free(working_dir);
-      free(system_prompt);
       free(type);
       continue;
     }
 
     if (strcmp(type, "message") == 0) {
-      char *role = chi_json_get_string(line, "role");
-      char *text = chi_json_get_string(line, "text");
-      char *tool_call_id = chi_json_get_string(line, "tool_call_id");
-      char *tool_name = chi_json_get_string(line, "tool_name");
-      char *arguments_json = chi_json_get_string(line, "arguments_json");
-      double tool_is_custom_num = 0;
-      int tool_is_custom = chi_json_get_number(line, "tool_is_custom", &tool_is_custom_num) && tool_is_custom_num > 0;
-      char *tool_call_id_opt = NULL;
-      char *tool_name_opt = NULL;
-      char *arguments_json_opt = NULL;
-
-      if (role == NULL || text == NULL) {
-        *err_out = chi_format("invalid session message in '%s'", cfg->session_path);
-        free(role);
-        free(text);
-        free(tool_call_id);
-        free(tool_name);
-        free(arguments_json);
+      if (!chi_session_add_message_record(conversation, line, cfg->session_path, err_out)) {
         free(type);
         goto fail;
       }
-
-      tool_call_id_opt = chi_strdup_nonblank_or_null(tool_call_id);
-      tool_name_opt = chi_strdup_nonblank_or_null(tool_name);
-      arguments_json_opt = chi_strdup_nonblank_or_null(arguments_json);
-
-      if ((tool_call_id_opt == NULL && !chi_is_blank(tool_call_id)) ||
-          (tool_name_opt == NULL && !chi_is_blank(tool_name)) ||
-          (arguments_json_opt == NULL && !chi_is_blank(arguments_json)) ||
-          !chi_conversation_add(
-              conversation, role, text, tool_call_id_opt, tool_name_opt, arguments_json_opt, tool_is_custom)) {
-        *err_out = chi_strdup("failed to restore session message");
-        free(role);
-        free(text);
-        free(tool_call_id);
-        free(tool_name);
-        free(arguments_json);
-        free(tool_call_id_opt);
-        free(tool_name_opt);
-        free(arguments_json_opt);
-        free(type);
-        goto fail;
-      }
-
-      free(role);
-      free(text);
-      free(tool_call_id);
-      free(tool_name);
-      free(arguments_json);
-      free(tool_call_id_opt);
-      free(tool_name_opt);
-      free(arguments_json_opt);
       free(type);
       continue;
     }
@@ -1306,11 +1335,7 @@ static int chi_session_load(
   }
 
   free(line);
-  if (fclose(fp) != 0) {
-    *err_out = chi_format("failed to close session file '%s': %s", cfg->session_path, strerror(errno));
-    return 0;
-  }
-  return 1;
+  return chi_close_session_file(fp, cfg->session_path, err_out);
 
 fail:
   free(line);
@@ -3371,10 +3396,7 @@ static int chi_append_responses_input(
   return 1;
 }
 
-static char *chi_build_request_json(const chi_config *cfg, const chi_conversation *conversation, char **err_out) {
-  const char *system_prompt = cfg->system_prompt_text;
-  const char *input_system_prompt = cfg->backend == CHI_BACKEND_CHATGPT ? NULL : system_prompt;
-  const char *reasoning_effort = chi_normalize_reasoning_effort(cfg->reasoning_effort);
+static int chi_append_request_tools(char **buf, size_t *len, size_t *cap) {
   const char *apply_patch_description =
       "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.";
   const char *apply_patch_grammar =
@@ -3406,6 +3428,58 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
       "\"required\":[\"command\"]"
       "}"
       "}";
+
+  return chi_append(buf, len, cap, ",\"tools\":[") &&
+         chi_append(buf, len, cap, bash_tool_json) &&
+         chi_append(buf, len, cap, ",{\"type\":\"custom\",\"name\":\"apply_patch\",\"description\":") &&
+         chi_append_json_quoted(buf, len, cap, apply_patch_description) &&
+         chi_append(buf, len, cap, ",\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\",\"definition\":") &&
+         chi_append_json_quoted(buf, len, cap, apply_patch_grammar) &&
+         chi_append(buf, len, cap, "}}]") &&
+         chi_append(buf, len, cap, ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
+}
+
+static int chi_append_request_reasoning(
+    char **buf,
+    size_t *len,
+    size_t *cap,
+    const char *reasoning_effort) {
+  if (reasoning_effort == NULL) {
+    return 1;
+  }
+
+  if (!chi_append(buf, len, cap, ",\"reasoning\":{\"effort\":") ||
+      !chi_append_json_quoted(buf, len, cap, reasoning_effort)) {
+    return 0;
+  }
+
+  if (!chi_equals_ignore_case(reasoning_effort, "none") &&
+      !chi_append(buf, len, cap, ",\"summary\":\"auto\"")) {
+    return 0;
+  }
+
+  return chi_append(buf, len, cap, "}");
+}
+
+static int chi_append_request_instructions(
+    const chi_config *cfg,
+    char **buf,
+    size_t *len,
+    size_t *cap) {
+  const char *system_prompt = cfg->system_prompt_text;
+
+  if (cfg->backend != CHI_BACKEND_CHATGPT) {
+    return 1;
+  }
+
+  return chi_append(buf, len, cap, ",\"instructions\":") &&
+         chi_append_json_quoted(buf, len, cap, system_prompt == NULL ? "" : system_prompt);
+}
+
+static char *chi_build_request_json(const chi_config *cfg, const chi_conversation *conversation, char **err_out) {
+  const char *system_prompt = cfg->system_prompt_text;
+  const char *input_system_prompt = cfg->backend == CHI_BACKEND_CHATGPT ? NULL : system_prompt;
+  const char *reasoning_effort = chi_normalize_reasoning_effort(cfg->reasoning_effort);
   char *json = NULL;
   size_t len = 0;
   size_t cap = 0;
@@ -3417,39 +3491,17 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
       !chi_append_json_quoted(&json, &len, &cap, cfg->model) ||
       !chi_append(&json, &len, &cap, ",") ||
       !chi_append_responses_input(conversation, input_system_prompt, &json, &len, &cap) ||
-      !chi_append(&json, &len, &cap, ",\"tools\":[") ||
-      !chi_append(&json, &len, &cap, bash_tool_json) ||
-      !chi_append(&json, &len, &cap, ",{\"type\":\"custom\",\"name\":\"apply_patch\",\"description\":") ||
-      !chi_append_json_quoted(&json, &len, &cap, apply_patch_description) ||
-      !chi_append(&json, &len, &cap, ",\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\",\"definition\":") ||
-      !chi_append_json_quoted(&json, &len, &cap, apply_patch_grammar) ||
-      !chi_append(&json, &len, &cap, "}}") ||
-      !chi_append(&json, &len, &cap, "]") ||
-      !chi_append(&json, &len, &cap, ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true")) {
+      !chi_append_request_tools(&json, &len, &cap)) {
     free(json);
     *err_out = chi_strdup("out of memory while building provider request");
     return NULL;
   }
 
-  if (reasoning_effort != NULL) {
-    if (!chi_append(&json, &len, &cap, ",\"reasoning\":{\"effort\":") ||
-        !chi_append_json_quoted(&json, &len, &cap, reasoning_effort) ||
-        (!chi_equals_ignore_case(reasoning_effort, "none") &&
-         (!chi_append(&json, &len, &cap, ",\"summary\":\"auto\""))) ||
-        !chi_append(&json, &len, &cap, "}")) {
-      free(json);
-      *err_out = chi_strdup("out of memory while building provider request");
-      return NULL;
-    }
-  }
-
-  if (cfg->backend == CHI_BACKEND_CHATGPT) {
-    if (!chi_append(&json, &len, &cap, ",\"instructions\":") ||
-        !chi_append_json_quoted(&json, &len, &cap, system_prompt == NULL ? "" : system_prompt)) {
-      free(json);
-      *err_out = chi_strdup("out of memory while building provider request");
-      return NULL;
-    }
+  if (!chi_append_request_reasoning(&json, &len, &cap, reasoning_effort) ||
+      !chi_append_request_instructions(cfg, &json, &len, &cap)) {
+    free(json);
+    *err_out = chi_strdup("out of memory while building provider request");
+    return NULL;
   }
 
   if (!chi_append(&json, &len, &cap, ",\"store\":false,\"stream\":true}")) {
@@ -4010,6 +4062,244 @@ static int chi_queue_pop_to_conversation(chi_prompt_queue *queue, chi_conversati
   return ok;
 }
 
+static void chi_runtime_cleanup(chi_config *cfg, chi_conversation *convo, chi_prompt_queue *queue) {
+  chi_prompt_queue_destroy(queue);
+  chi_conversation_destroy(convo);
+  free(cfg->system_prompt_text);
+  free(cfg->session_path);
+  free(cfg->loaded_model);
+  free(cfg->loaded_reasoning_effort);
+  free(cfg->loaded_working_dir);
+  chi_clear_chatgpt_auth_cache(cfg);
+}
+
+static int chi_save_session_or_report(const chi_config *cfg, const chi_conversation *convo) {
+  char *save_err = NULL;
+  int ok = chi_session_save(cfg, convo, &save_err);
+
+  if (!ok) {
+    fprintf(stderr, "%s\n", save_err == NULL ? "failed to save session" : save_err);
+  }
+
+  free(save_err);
+  return ok;
+}
+
+static int chi_restore_session_or_report(
+    chi_config *cfg,
+    chi_conversation *convo,
+    const char *resume_session_id,
+    const char *working_dir,
+    int backend_explicit,
+    int model_explicit,
+    int reasoning_explicit,
+    int system_prompt_explicit,
+    int working_dir_explicit) {
+  char *load_err = NULL;
+  int ok;
+
+  cfg->working_dir = working_dir;
+  ok = chi_session_load(
+      cfg,
+      convo,
+      resume_session_id,
+      backend_explicit,
+      model_explicit,
+      reasoning_explicit,
+      system_prompt_explicit,
+      working_dir_explicit,
+      &load_err);
+  if (!ok) {
+    fprintf(stderr, "%s\n", load_err == NULL ? "failed to load session" : load_err);
+  }
+
+  free(load_err);
+  return ok;
+}
+
+static int chi_load_system_prompt_or_report(chi_config *cfg) {
+  char *load_err = NULL;
+
+  if (chi_is_blank(cfg->system_prompt_file)) {
+    return 1;
+  }
+
+  free(cfg->system_prompt_text);
+  cfg->system_prompt_text = chi_read_text_file(cfg->system_prompt_file, &load_err);
+  if (cfg->system_prompt_text != NULL) {
+    free(load_err);
+    return 1;
+  }
+
+  fprintf(stderr, "%s\n", load_err == NULL ? "failed to load system prompt file" : load_err);
+  free(load_err);
+  return 0;
+}
+
+static int chi_ensure_action_tool_call_id(chi_action *action, unsigned long long *call_seq) {
+  if (!action->is_tool || !chi_is_blank(action->tool_call_id)) {
+    return 1;
+  }
+
+  (*call_seq)++;
+  action->tool_call_id = chi_format("call_%llu", *call_seq);
+  return action->tool_call_id != NULL;
+}
+
+static int chi_append_assistant_action(chi_conversation *convo, const chi_action *action) {
+  return chi_conversation_add(
+      convo,
+      "assistant",
+      action->assistant_text,
+      action->is_tool ? action->tool_call_id : NULL,
+      action->is_tool ? action->tool_name : NULL,
+      action->is_tool ? action->tool_arguments_json : NULL,
+      action->is_tool ? action->tool_is_custom : 0);
+}
+
+static int chi_run_tool_action(
+    const chi_config *cfg,
+    const chi_action *action,
+    char **tool_output_out,
+    int *is_error_out,
+    char **tool_error_out,
+    const char **runner_error_out) {
+  double timeout = action->timeout_seconds > 0 ? action->timeout_seconds : 0;
+  const char *tool_name = chi_is_blank(action->tool_name) ? "bash" : action->tool_name;
+
+  *tool_output_out = NULL;
+  *is_error_out = 1;
+  *tool_error_out = NULL;
+  *runner_error_out = NULL;
+
+  if (action->tool_is_custom) {
+    if (strcmp(tool_name, "apply_patch") == 0) {
+      if (chi_run_apply_patch_tool(
+              cfg->working_dir, action->tool_command, tool_output_out, is_error_out, tool_error_out)) {
+        return 1;
+      }
+
+      *runner_error_out = "failed to run apply_patch";
+      return 0;
+    }
+
+    *tool_output_out = chi_strdup("");
+    *tool_error_out = chi_format("unsupported custom tool: %s", tool_name);
+    *is_error_out = 1;
+    if (*tool_output_out != NULL && *tool_error_out != NULL) {
+      return 1;
+    }
+
+    *runner_error_out = "out of memory handling unsupported custom tool";
+    return 0;
+  }
+
+  if (strcmp(tool_name, "bash") == 0) {
+    if (chi_run_bash(cfg->working_dir, action->tool_command, timeout, tool_output_out, is_error_out, tool_error_out)) {
+      return 1;
+    }
+
+    *runner_error_out = "failed to run bash tool";
+    return 0;
+  }
+
+  if (strcmp(tool_name, "apply_patch") == 0) {
+    *tool_output_out = chi_strdup("");
+    *tool_error_out = chi_strdup("apply_patch must be called as a freeform custom tool");
+    *is_error_out = 1;
+    if (*tool_output_out != NULL && *tool_error_out != NULL) {
+      return 1;
+    }
+
+    *runner_error_out = "out of memory handling unsupported apply_patch invocation";
+    return 0;
+  }
+
+  *tool_output_out = chi_strdup("");
+  *tool_error_out = chi_format("unsupported function tool: %s", tool_name);
+  *is_error_out = 1;
+  if (*tool_output_out != NULL && *tool_error_out != NULL) {
+    return 1;
+  }
+
+  *runner_error_out = "out of memory handling unsupported function tool";
+  return 0;
+}
+
+static int chi_build_tool_record(const char *tool_output, const char *tool_error, char **tool_record_out) {
+  *tool_record_out = NULL;
+
+  if (tool_error == NULL) {
+    *tool_record_out = chi_strdup(tool_output == NULL ? "" : tool_output);
+    return *tool_record_out != NULL;
+  }
+
+  *tool_record_out = chi_format("%s\n\n[tool error] %s", tool_output == NULL ? "" : tool_output, tool_error);
+  return *tool_record_out != NULL;
+}
+
+static int chi_handle_tool_action(
+    chi_config *cfg,
+    chi_conversation *convo,
+    chi_prompt_queue *queue,
+    const chi_action *action) {
+  char *call_id = NULL;
+  char *tool_output = NULL;
+  char *tool_error = NULL;
+  char *tool_record = NULL;
+  const char *tool_name = chi_is_blank(action->tool_name) ? "bash" : action->tool_name;
+  const char *runner_error = NULL;
+  int is_error = 0;
+  int ok = 0;
+
+  call_id = chi_strdup(action->tool_call_id);
+  if (call_id == NULL) {
+    fprintf(stderr, "out of memory preparing tool call id\n");
+    goto cleanup;
+  }
+
+  printf("[tool start] %s (%s)\n", tool_name, call_id);
+  if (action->tool_is_custom) {
+    printf("[tool input]\n%s\n", action->tool_command == NULL ? "" : action->tool_command);
+  } else {
+    printf("[tool command]\n%s\n", action->tool_command == NULL ? "" : action->tool_command);
+  }
+
+  if (!chi_run_tool_action(cfg, action, &tool_output, &is_error, &tool_error, &runner_error)) {
+    fprintf(stderr, "%s\n", runner_error == NULL ? "tool failed" : runner_error);
+    goto cleanup;
+  }
+
+  printf("[tool done] %s (%s) error=%d\n", tool_name, call_id, is_error);
+  if (!chi_is_blank(tool_output)) {
+    printf("%s\n", tool_output);
+  }
+
+  if (!chi_build_tool_record(tool_output, tool_error, &tool_record) ||
+      !chi_conversation_add(convo, "toolResult", tool_record, call_id, NULL, NULL, action->tool_is_custom)) {
+    fprintf(stderr, "failed to append tool result\n");
+    goto cleanup;
+  }
+
+  if (queue->count > 0 && !chi_queue_pop_to_conversation(queue, convo)) {
+    fprintf(stderr, "failed to inject queued user message\n");
+    goto cleanup;
+  }
+
+  if (!chi_save_session_or_report(cfg, convo)) {
+    goto cleanup;
+  }
+
+  ok = 1;
+
+cleanup:
+  free(call_id);
+  free(tool_output);
+  free(tool_error);
+  free(tool_record);
+  return ok;
+}
+
 int main(int argc, char **argv) {
   chi_config cfg;
   chi_conversation convo;
@@ -4151,7 +4441,7 @@ int main(int argc, char **argv) {
   if (!chi_is_blank(resume_session_id)) {
     if (strlen(resume_session_id) >= sizeof(cfg.session_id)) {
       fprintf(stderr, "session id is too long\n");
-      chi_prompt_queue_destroy(&queue);
+      chi_runtime_cleanup(&cfg, &convo, &queue);
       return 2;
     }
     memcpy(cfg.session_id, resume_session_id, strlen(resume_session_id) + 1);
@@ -4162,71 +4452,43 @@ int main(int argc, char **argv) {
   cfg.session_path = chi_build_session_path(cfg.session_dir, cfg.session_id);
   if (cfg.session_path == NULL) {
     fprintf(stderr, "failed to build session path\n");
-    chi_prompt_queue_destroy(&queue);
+    chi_runtime_cleanup(&cfg, &convo, &queue);
+    return 1;
+  }
+
+  if (!chi_is_blank(resume_session_id) &&
+      !chi_restore_session_or_report(
+          &cfg,
+          &convo,
+          resume_session_id,
+          working_dir,
+          backend_explicit,
+          model_explicit,
+          reasoning_explicit,
+          system_prompt_explicit,
+          working_dir_explicit)) {
+    chi_runtime_cleanup(&cfg, &convo, &queue);
     return 1;
   }
 
   if (!chi_is_blank(resume_session_id)) {
-    char *load_err = NULL;
-    cfg.working_dir = working_dir;
-    if (!chi_session_load(
-            &cfg,
-            &convo,
-            resume_session_id,
-            backend_explicit,
-            model_explicit,
-            reasoning_explicit,
-            system_prompt_explicit,
-            working_dir_explicit,
-            &load_err)) {
-      fprintf(stderr, "%s\n", load_err == NULL ? "failed to load session" : load_err);
-      free(load_err);
-      chi_prompt_queue_destroy(&queue);
-      chi_conversation_destroy(&convo);
-      free(cfg.system_prompt_text);
-      free(cfg.session_path);
-      free(cfg.loaded_model);
-      free(cfg.loaded_reasoning_effort);
-      free(cfg.loaded_working_dir);
-      chi_clear_chatgpt_auth_cache(&cfg);
-      return 1;
-    }
     call_seq = chi_conversation_max_generated_call_seq(&convo);
   }
 
-  if (!chi_is_blank(cfg.system_prompt_file)) {
-    char *load_err = NULL;
-    free(cfg.system_prompt_text);
-    cfg.system_prompt_text = chi_read_text_file(cfg.system_prompt_file, &load_err);
-    if (cfg.system_prompt_text == NULL) {
-      fprintf(stderr, "%s\n", load_err == NULL ? "failed to load system prompt file" : load_err);
-      free(load_err);
-      chi_prompt_queue_destroy(&queue);
-      chi_conversation_destroy(&convo);
-      free(cfg.system_prompt_text);
-      free(cfg.session_path);
-      free(cfg.loaded_model);
-      free(cfg.loaded_reasoning_effort);
-      free(cfg.loaded_working_dir);
-      chi_clear_chatgpt_auth_cache(&cfg);
-      return 2;
-    }
+  if (!chi_load_system_prompt_or_report(&cfg)) {
+    chi_runtime_cleanup(&cfg, &convo, &queue);
+    return 2;
   }
 
   if (!chi_prompt_queue_push_front(&queue, prompt)) {
     fprintf(stderr, "failed to queue initial prompt\n");
-    chi_prompt_queue_destroy(&queue);
-    chi_conversation_destroy(&convo);
-    free(cfg.system_prompt_text);
-    free(cfg.session_path);
-    free(cfg.loaded_model);
-    free(cfg.loaded_reasoning_effort);
-    free(cfg.loaded_working_dir);
-    chi_clear_chatgpt_auth_cache(&cfg);
+    chi_runtime_cleanup(&cfg, &convo, &queue);
     return 1;
   }
 
-  cfg.working_dir = working_dir_explicit ? working_dir : (cfg.working_dir == NULL ? working_dir : cfg.working_dir);
+  if (working_dir_explicit || cfg.working_dir == NULL) {
+    cfg.working_dir = working_dir;
+  }
 
   while (queue.count > 0) {
     int finalized = 0;
@@ -4238,15 +4500,9 @@ int main(int argc, char **argv) {
       goto cleanup;
     }
 
-    {
-      char *save_err = NULL;
-      if (!chi_session_save(&cfg, &convo, &save_err)) {
-        fprintf(stderr, "%s\n", save_err == NULL ? "failed to save session" : save_err);
-        free(save_err);
-        exit_code = 1;
-        goto cleanup;
-      }
-      free(save_err);
+    if (!chi_save_session_or_report(&cfg, &convo)) {
+      exit_code = 1;
+      goto cleanup;
     }
 
     for (turn = 0; turn < max_turns; turn++) {
@@ -4262,41 +4518,24 @@ int main(int argc, char **argv) {
         goto cleanup;
       }
 
-      if (action.is_tool && chi_is_blank(action.tool_call_id)) {
-        call_seq++;
-        action.tool_call_id = chi_format("call_%llu", call_seq);
-        if (action.tool_call_id == NULL) {
-          fprintf(stderr, "out of memory generating tool call id\n");
-          chi_action_reset(&action);
-          exit_code = 1;
-          goto cleanup;
-        }
+      if (!chi_ensure_action_tool_call_id(&action, &call_seq)) {
+        fprintf(stderr, "out of memory generating tool call id\n");
+        chi_action_reset(&action);
+        exit_code = 1;
+        goto cleanup;
       }
 
-      if (!chi_conversation_add(
-              &convo,
-              "assistant",
-              action.assistant_text,
-              action.is_tool ? action.tool_call_id : NULL,
-              action.is_tool ? action.tool_name : NULL,
-              action.is_tool ? action.tool_arguments_json : NULL,
-              action.is_tool ? action.tool_is_custom : 0)) {
+      if (!chi_append_assistant_action(&convo, &action)) {
         fprintf(stderr, "failed to append assistant message\n");
         chi_action_reset(&action);
         exit_code = 1;
         goto cleanup;
       }
 
-      {
-        char *save_err = NULL;
-        if (!chi_session_save(&cfg, &convo, &save_err)) {
-          fprintf(stderr, "%s\n", save_err == NULL ? "failed to save session" : save_err);
-          free(save_err);
-          chi_action_reset(&action);
-          exit_code = 1;
-          goto cleanup;
-        }
-        free(save_err);
+      if (!chi_save_session_or_report(&cfg, &convo)) {
+        chi_action_reset(&action);
+        exit_code = 1;
+        goto cleanup;
       }
 
       if (!chi_is_blank(action.reasoning_summary)) {
@@ -4311,121 +4550,10 @@ int main(int argc, char **argv) {
         break;
       }
 
-      {
-        char *call_id = NULL;
-        char *tool_output = NULL;
-        char *tool_error = NULL;
-        char *tool_record = NULL;
-        int is_error = 0;
-        int tool_step_ok = 0;
-        double timeout = action.timeout_seconds > 0 ? action.timeout_seconds : 0;
-        const char *tool_name = chi_is_blank(action.tool_name) ? "bash" : action.tool_name;
-
-        call_id = chi_strdup(action.tool_call_id);
-        if (call_id == NULL) {
-          fprintf(stderr, "out of memory preparing tool call id\n");
-          goto tool_cleanup;
-        }
-
-        printf("[tool start] %s (%s)\n", tool_name, call_id);
-        if (action.tool_is_custom) {
-          printf("[tool input]\n%s\n", action.tool_command == NULL ? "" : action.tool_command);
-        } else {
-          printf("[tool command]\n%s\n", action.tool_command == NULL ? "" : action.tool_command);
-        }
-
-        if (action.tool_is_custom) {
-          if (strcmp(tool_name, "apply_patch") == 0) {
-            if (!chi_run_apply_patch_tool(
-                    cfg.working_dir, action.tool_command, &tool_output, &is_error, &tool_error)) {
-              fprintf(stderr, "failed to run apply_patch\n");
-              goto tool_cleanup;
-            }
-          } else {
-            tool_output = chi_strdup("");
-            tool_error = chi_format("unsupported custom tool: %s", tool_name);
-            is_error = 1;
-            if (tool_output == NULL || tool_error == NULL) {
-              fprintf(stderr, "out of memory handling unsupported custom tool\n");
-              goto tool_cleanup;
-            }
-          }
-        } else if (strcmp(tool_name, "bash") == 0) {
-          if (!chi_run_bash(cfg.working_dir, action.tool_command, timeout, &tool_output, &is_error, &tool_error)) {
-            fprintf(stderr, "failed to run bash tool\n");
-            goto tool_cleanup;
-          }
-        } else if (strcmp(tool_name, "apply_patch") == 0) {
-          tool_output = chi_strdup("");
-          tool_error = chi_strdup("apply_patch must be called as a freeform custom tool");
-          is_error = 1;
-          if (tool_output == NULL || tool_error == NULL) {
-            fprintf(stderr, "out of memory handling unsupported apply_patch invocation\n");
-            goto tool_cleanup;
-          }
-        } else {
-          tool_output = chi_strdup("");
-          tool_error = chi_format("unsupported function tool: %s", tool_name);
-          is_error = 1;
-          if (tool_output == NULL || tool_error == NULL) {
-            fprintf(stderr, "out of memory handling unsupported function tool\n");
-            goto tool_cleanup;
-          }
-        }
-
-        printf("[tool done] %s (%s) error=%d\n", tool_name, call_id, is_error);
-        if (!chi_is_blank(tool_output)) {
-          printf("%s\n", tool_output);
-        }
-
-        if (tool_error != NULL) {
-          tool_record = chi_format("%s\n\n[tool error] %s", tool_output == NULL ? "" : tool_output, tool_error);
-        } else {
-          tool_record = chi_strdup(tool_output == NULL ? "" : tool_output);
-        }
-
-        if (tool_record == NULL ||
-            !chi_conversation_add(
-                &convo,
-                "toolResult",
-                tool_record,
-                call_id,
-                NULL,
-                NULL,
-                action.tool_is_custom)) {
-          fprintf(stderr, "failed to append tool result\n");
-          goto tool_cleanup;
-        }
-
-        if (queue.count > 0) {
-          if (!chi_queue_pop_to_conversation(&queue, &convo)) {
-            fprintf(stderr, "failed to inject queued user message\n");
-            goto tool_cleanup;
-          }
-        }
-
-        {
-          char *save_err = NULL;
-          if (!chi_session_save(&cfg, &convo, &save_err)) {
-            fprintf(stderr, "%s\n", save_err == NULL ? "failed to save session" : save_err);
-            free(save_err);
-            goto tool_cleanup;
-          }
-          free(save_err);
-        }
-
-        tool_step_ok = 1;
-
-      tool_cleanup:
-        free(call_id);
-        free(tool_output);
-        free(tool_error);
-        free(tool_record);
-        if (!tool_step_ok) {
-          chi_action_reset(&action);
-          exit_code = 1;
-          goto cleanup;
-        }
+      if (!chi_handle_tool_action(&cfg, &convo, &queue, &action)) {
+        chi_action_reset(&action);
+        exit_code = 1;
+        goto cleanup;
       }
 
       chi_action_reset(&action);
@@ -4439,14 +4567,7 @@ int main(int argc, char **argv) {
   }
 
 cleanup:
-  chi_prompt_queue_destroy(&queue);
-  chi_conversation_destroy(&convo);
-  free(cfg.system_prompt_text);
-  free(cfg.session_path);
-  free(cfg.loaded_model);
-  free(cfg.loaded_reasoning_effort);
-  free(cfg.loaded_working_dir);
-  chi_clear_chatgpt_auth_cache(&cfg);
+  chi_runtime_cleanup(&cfg, &convo, &queue);
   return exit_code;
 }
 #endif
