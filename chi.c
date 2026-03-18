@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -37,15 +38,22 @@
 #define CHI_CHATGPT_DEVICE_CODE_LIFETIME_MS (15LL * 60LL * 1000LL)
 #define CHI_CHATGPT_DEVICE_POLL_INTERVAL_MS_DEFAULT 5000LL
 #define CHI_CHATGPT_JWT_CLAIM_PATH "https://api.openai.com/auth"
-#define CHI_CHATGPT_AUTH_SOURCE_NONE 0
-#define CHI_CHATGPT_AUTH_SOURCE_ENV 1
-#define CHI_CHATGPT_AUTH_SOURCE_CHI_FILE 2
-#define CHI_CHATGPT_AUTH_SOURCE_LEGACY_CODEX 3
-
 typedef enum {
   CHI_BACKEND_OPENAI = 0,
   CHI_BACKEND_CHATGPT = 1
 } chi_backend;
+
+typedef enum {
+  CHI_CHATGPT_AUTH_SOURCE_NONE = 0,
+  CHI_CHATGPT_AUTH_SOURCE_ENV = 1,
+  CHI_CHATGPT_AUTH_SOURCE_CHI_FILE = 2,
+  CHI_CHATGPT_AUTH_SOURCE_LEGACY_CODEX = 3
+} chi_chatgpt_auth_source;
+
+typedef enum {
+  CHI_TOOL_KIND_FUNCTION = 0,
+  CHI_TOOL_KIND_CUSTOM = 1
+} chi_tool_kind;
 
 typedef struct {
   char *role;
@@ -74,18 +82,41 @@ typedef struct {
   int timed_out;
 } chi_shell_result;
 
+typedef enum {
+  CHI_ACTION_KIND_FINAL = 0,
+  CHI_ACTION_KIND_TOOL = 1
+} chi_action_kind;
+
 typedef struct {
-  int is_tool;
-  int tool_is_custom;
+  chi_tool_kind kind;
+  char *call_id;
+  char *name;
+  char *arguments_json;
+  char *command;
+  double timeout_seconds;
+} chi_tool_action;
+
+typedef struct {
+  chi_action_kind kind;
   char *assistant_text;
   char *reasoning_summary;
-  char *final_text;
-  char *tool_call_id;
-  char *tool_name;
-  char *tool_arguments_json;
-  char *tool_command;
-  double timeout_seconds;
+  union {
+    char *final_text;
+    chi_tool_action tool;
+  } data;
 } chi_action;
+
+typedef struct {
+  chi_tool_kind kind;
+  char *call_id;
+  char *name;
+  char *payload;
+} chi_provider_tool_call;
+
+typedef enum {
+  CHI_SESSION_RECORD_META = 0,
+  CHI_SESSION_RECORD_MESSAGE = 1
+} chi_session_record_type;
 
 typedef struct {
   chi_backend backend;
@@ -105,13 +136,14 @@ typedef struct {
   char *chatgpt_refresh_token;
   char *chatgpt_account_id;
   long long chatgpt_expires_at_ms;
-  int chatgpt_auth_source;
+  chi_chatgpt_auth_source chatgpt_auth_source;
   int chatgpt_login_attempted;
 } chi_config;
 
 static int chi_parse_backend(const char *value, chi_backend *out);
 static char *chi_json_get_string(const char *json, const char *key);
 static int chi_json_get_number(const char *json, const char *key, double *out);
+static void chi_provider_tool_call_reset(chi_provider_tool_call *call);
 
 static char *chi_strdup(const char *s) {
   size_t len;
@@ -1099,6 +1131,36 @@ static void chi_session_free_meta_fields(
   free(system_prompt);
 }
 
+static int chi_parse_session_record_type(
+    const char *line,
+    const char *session_path,
+    chi_session_record_type *out,
+    char **err_out) {
+  char *type = chi_json_get_string(line, "type");
+
+  *err_out = NULL;
+  if (type == NULL) {
+    *err_out = chi_format("invalid session record in '%s'", session_path);
+    return 0;
+  }
+
+  if (strcmp(type, "meta") == 0) {
+    *out = CHI_SESSION_RECORD_META;
+    free(type);
+    return 1;
+  }
+
+  if (strcmp(type, "message") == 0) {
+    *out = CHI_SESSION_RECORD_MESSAGE;
+    free(type);
+    return 1;
+  }
+
+  *err_out = chi_format("unsupported session record type '%s' in '%s'", type, session_path);
+  free(type);
+  return 0;
+}
+
 static int chi_session_apply_meta_record(
     chi_config *cfg,
     const char *line,
@@ -1276,7 +1338,7 @@ static int chi_session_load(
   }
 
   while ((line_len = getline(&line, &line_cap, fp)) >= 0) {
-    char *type = NULL;
+    chi_session_record_type type;
 
     (void)line_len;
     chi_trim_trailing_newlines(line);
@@ -1284,13 +1346,11 @@ static int chi_session_load(
       continue;
     }
 
-    type = chi_json_get_string(line, "type");
-    if (type == NULL) {
-      *err_out = chi_format("invalid session record in '%s'", cfg->session_path);
+    if (!chi_parse_session_record_type(line, cfg->session_path, &type, err_out)) {
       goto fail;
     }
 
-    if (strcmp(type, "meta") == 0) {
+    if (type == CHI_SESSION_RECORD_META) {
       if (!chi_session_apply_meta_record(
               cfg,
               line,
@@ -1301,26 +1361,22 @@ static int chi_session_load(
               keep_system_prompt,
               keep_working_dir,
               err_out)) {
-        free(type);
         goto fail;
       }
 
       saw_meta = 1;
-      free(type);
       continue;
     }
 
-    if (strcmp(type, "message") == 0) {
+    if (type == CHI_SESSION_RECORD_MESSAGE) {
       if (!chi_session_add_message_record(conversation, line, cfg->session_path, err_out)) {
-        free(type);
         goto fail;
       }
-      free(type);
       continue;
     }
 
-    *err_out = chi_format("unsupported session record type '%s' in '%s'", type, cfg->session_path);
-    free(type);
+    assert(!"unreachable session record type");
+    *err_out = chi_strdup("unreachable session record type");
     goto fail;
   }
 
@@ -1694,7 +1750,7 @@ static int chi_set_chatgpt_auth_cache(
     const char *refresh_token,
     const char *account_id,
     long long expires_at_ms,
-    int auth_source) {
+    chi_chatgpt_auth_source auth_source) {
   char *access_copy = NULL;
   char *refresh_copy = NULL;
   char *account_copy = NULL;
@@ -2710,18 +2766,10 @@ static char *chi_extract_responses_output_text(const char *json) {
   return NULL;
 }
 
-static int chi_extract_responses_tool_call(
-    const char *json,
-    char **call_id_out,
-    char **tool_name_out,
-    char **tool_payload_out,
-    int *is_custom_out) {
+static int chi_extract_responses_tool_call(const char *json, chi_provider_tool_call *out) {
   const char *p;
 
-  *call_id_out = NULL;
-  *tool_name_out = NULL;
-  *tool_payload_out = NULL;
-  *is_custom_out = 0;
+  memset(out, 0, sizeof(*out));
 
   if (json == NULL) {
     return 0;
@@ -2738,43 +2786,35 @@ static int chi_extract_responses_tool_call(
 
     type = chi_json_get_string(p, "type");
     if (type != NULL && strcmp(type, "custom_tool_call") == 0) {
-      char *call_id = chi_json_get_string(p, "call_id");
-      char *tool_name = chi_json_get_string(p, "name");
-      char *tool_input = chi_json_get_string(p, "input");
+      out->kind = CHI_TOOL_KIND_CUSTOM;
+      out->call_id = chi_json_get_string(p, "call_id");
+      out->name = chi_json_get_string(p, "name");
+      out->payload = chi_json_get_string(p, "input");
       free(type);
 
-      if (tool_input == NULL) {
-        free(call_id);
-        free(tool_name);
+      if (out->payload == NULL) {
+        chi_provider_tool_call_reset(out);
         return 0;
       }
 
-      *call_id_out = call_id;
-      *tool_name_out = tool_name;
-      *tool_payload_out = tool_input;
-      *is_custom_out = 1;
       return 1;
     }
     if (type != NULL && strcmp(type, "function_call") == 0) {
-      char *call_id = chi_json_get_string(p, "call_id");
-      char *tool_name = chi_json_get_string(p, "name");
-      char *arguments = chi_json_get_string(p, "arguments");
+      out->kind = CHI_TOOL_KIND_FUNCTION;
+      out->call_id = chi_json_get_string(p, "call_id");
+      out->name = chi_json_get_string(p, "name");
+      out->payload = chi_json_get_string(p, "arguments");
       free(type);
 
-      if (chi_is_blank(arguments)) {
-        free(arguments);
-        arguments = chi_strdup("{}");
+      if (chi_is_blank(out->payload)) {
+        free(out->payload);
+        out->payload = chi_strdup("{}");
       }
-      if (arguments == NULL) {
-        free(call_id);
-        free(tool_name);
+      if (out->payload == NULL) {
+        chi_provider_tool_call_reset(out);
         return 0;
       }
 
-      *call_id_out = call_id;
-      *tool_name_out = tool_name;
-      *tool_payload_out = arguments;
-      *is_custom_out = 0;
       return 1;
     }
     free(type);
@@ -3096,6 +3136,16 @@ static char *chi_extract_incomplete_reason(const char *json) {
   return chi_json_get_string(details, "reason");
 }
 
+static void chi_provider_tool_call_reset(chi_provider_tool_call *call) {
+  if (call == NULL) {
+    return;
+  }
+  free(call->call_id);
+  free(call->name);
+  free(call->payload);
+  memset(call, 0, sizeof(*call));
+}
+
 static int chi_parse_action(const char *raw_text, chi_action *out, char **err_out) {
   char *json = NULL;
   char *kind = NULL;
@@ -3116,46 +3166,63 @@ static int chi_parse_action(const char *raw_text, chi_action *out, char **err_ou
 
   json = chi_extract_first_json_object(raw_text);
   if (json == NULL) {
-    out->final_text = chi_strdup(raw_text);
-    return out->final_text != NULL;
+    out->kind = CHI_ACTION_KIND_FINAL;
+    out->data.final_text = chi_strdup(raw_text);
+    return out->data.final_text != NULL;
   }
 
   kind = chi_json_get_string(json, "kind");
   if (kind != NULL && strcmp(kind, "tool") == 0) {
-    double timeout = 0;
-    out->tool_name = chi_json_get_string(json, "name");
-    out->tool_command = chi_json_get_string(json, "command");
-    if (chi_is_blank(out->tool_name)) {
-      free(out->tool_name);
-      out->tool_name = chi_strdup("bash");
+    char *tool_name = NULL;
+    char *tool_command = NULL;
+    double timeout_seconds = 0;
+
+    tool_name = chi_json_get_string(json, "name");
+    tool_command = chi_json_get_string(json, "command");
+
+    if (chi_is_blank(tool_name)) {
+      free(tool_name);
+      tool_name = chi_strdup("bash");
     }
-    if (chi_is_blank(out->tool_command)) {
-      free(out->tool_command);
-      out->tool_command = NULL;
-      out->final_text = chi_strdup("tool call missing command");
-      out->is_tool = 0;
+    if (tool_name == NULL) {
+      free(tool_command);
       free(kind);
       free(json);
-      return out->final_text != NULL;
+      *err_out = chi_strdup("out of memory");
+      return 0;
     }
-    if (chi_json_get_number(json, "timeout", &timeout) && timeout > 0) {
-      out->timeout_seconds = timeout;
+    if (chi_is_blank(tool_command)) {
+      free(tool_name);
+      free(tool_command);
+      out->kind = CHI_ACTION_KIND_FINAL;
+      out->data.final_text = chi_strdup("tool call missing command");
+      free(kind);
+      free(json);
+      return out->data.final_text != NULL;
     }
-    out->is_tool = 1;
+
+    out->kind = CHI_ACTION_KIND_TOOL;
+    out->data.tool.kind = CHI_TOOL_KIND_FUNCTION;
+    out->data.tool.name = tool_name;
+    out->data.tool.command = tool_command;
+    if (chi_json_get_number(json, "timeout", &timeout_seconds) && timeout_seconds > 0) {
+      out->data.tool.timeout_seconds = timeout_seconds;
+    }
     free(kind);
     free(json);
     return 1;
   }
 
-  out->final_text = chi_json_get_string(json, "text");
-  if (chi_is_blank(out->final_text)) {
-    free(out->final_text);
-    out->final_text = chi_strdup(raw_text);
+  out->kind = CHI_ACTION_KIND_FINAL;
+  out->data.final_text = chi_json_get_string(json, "text");
+  if (chi_is_blank(out->data.final_text)) {
+    free(out->data.final_text);
+    out->data.final_text = chi_strdup(raw_text);
   }
 
   free(kind);
   free(json);
-  return out->final_text != NULL;
+  return out->data.final_text != NULL;
 }
 
 static void chi_action_reset(chi_action *a) {
@@ -3164,11 +3231,14 @@ static void chi_action_reset(chi_action *a) {
   }
   free(a->assistant_text);
   free(a->reasoning_summary);
-  free(a->final_text);
-  free(a->tool_call_id);
-  free(a->tool_name);
-  free(a->tool_arguments_json);
-  free(a->tool_command);
+  if (a->kind == CHI_ACTION_KIND_FINAL) {
+    free(a->data.final_text);
+  } else {
+    free(a->data.tool.call_id);
+    free(a->data.tool.name);
+    free(a->data.tool.arguments_json);
+    free(a->data.tool.command);
+  }
   memset(a, 0, sizeof(*a));
 }
 
@@ -3520,16 +3590,14 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
   char *reasoning_summary = NULL;
   char *status = NULL;
   char *reason = NULL;
-  char *call_id = NULL;
-  char *tool_name = NULL;
-  char *tool_call_payload = NULL;
-  double timeout = 0;
+  chi_provider_tool_call tool_call;
+  double timeout_seconds = 0;
   int has_tool = 0;
-  int tool_is_custom = 0;
   int ok;
 
   *err_out = NULL;
   memset(action, 0, sizeof(*action));
+  memset(&tool_call, 0, sizeof(tool_call));
 
   payload = chi_extract_provider_payload(response_body);
   if (payload == NULL) {
@@ -3539,12 +3607,10 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
 
   tool_payload = chi_extract_sse_payload(response_body, "response.output_item.done");
   if (tool_payload != NULL) {
-    has_tool = chi_extract_responses_tool_call(
-        tool_payload, &call_id, &tool_name, &tool_call_payload, &tool_is_custom);
+    has_tool = chi_extract_responses_tool_call(tool_payload, &tool_call);
   }
   if (!has_tool) {
-    has_tool = chi_extract_responses_tool_call(
-        payload, &call_id, &tool_name, &tool_call_payload, &tool_is_custom);
+    has_tool = chi_extract_responses_tool_call(payload, &tool_call);
   }
 
   output_text = chi_extract_responses_output_text(payload);
@@ -3570,15 +3636,16 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
     action->reasoning_summary = reasoning_summary;
     reasoning_summary = NULL;
     output_text = NULL;
-    action->tool_call_id = call_id;
-    action->tool_name = tool_name;
-    action->tool_arguments_json = tool_call_payload;
-    action->tool_is_custom = tool_is_custom;
-    call_id = NULL;
-    tool_name = NULL;
-    tool_call_payload = NULL;
+    action->kind = CHI_ACTION_KIND_TOOL;
+    action->data.tool.kind = tool_call.kind;
+    action->data.tool.call_id = tool_call.call_id;
+    action->data.tool.name = tool_call.name;
+    action->data.tool.arguments_json = tool_call.payload;
+    tool_call.call_id = NULL;
+    tool_call.name = NULL;
+    tool_call.payload = NULL;
 
-    if (action->assistant_text == NULL || action->tool_arguments_json == NULL) {
+    if (action->assistant_text == NULL || action->data.tool.arguments_json == NULL) {
       chi_action_reset(action);
       *err_out = chi_strdup("out of memory while parsing tool call");
       free(status);
@@ -3587,16 +3654,18 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
       free(payload);
       free(tool_payload);
       free(output_done_payload);
-      free(call_id);
-      free(tool_name);
-      free(tool_call_payload);
+      chi_provider_tool_call_reset(&tool_call);
       return 0;
     }
 
-    if (chi_is_blank(action->tool_name)) {
-      free(action->tool_name);
-      action->tool_name = chi_strdup(action->tool_is_custom ? "tool" : "bash");
-      if (action->tool_name == NULL) {
+    if (chi_is_blank(action->data.tool.name)) {
+      free(action->data.tool.name);
+      if (action->data.tool.kind == CHI_TOOL_KIND_CUSTOM) {
+        action->data.tool.name = chi_strdup("tool");
+      } else {
+        action->data.tool.name = chi_strdup("bash");
+      }
+      if (action->data.tool.name == NULL) {
         chi_action_reset(action);
         *err_out = chi_strdup("out of memory while parsing tool call");
         free(status);
@@ -3605,41 +3674,44 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
         free(payload);
         free(tool_payload);
         free(output_done_payload);
-        free(call_id);
-        free(tool_name);
-        free(tool_call_payload);
+        chi_provider_tool_call_reset(&tool_call);
         return 0;
       }
     }
 
-    if (action->tool_is_custom) {
-      action->tool_command = chi_strdup(action->tool_arguments_json);
-      if (chi_is_blank(action->tool_command)) {
-        free(action->tool_command);
-        action->tool_command = NULL;
-        action->final_text = chi_strdup("tool call missing input");
-        action->is_tool = 0;
-        ok = action->final_text != NULL;
-      } else {
-        action->is_tool = 1;
-        ok = 1;
-      }
+    if (action->data.tool.kind == CHI_TOOL_KIND_CUSTOM) {
+      action->data.tool.command = chi_strdup(action->data.tool.arguments_json);
     } else {
-      action->tool_command = chi_json_get_string(action->tool_arguments_json, "command");
-      if (chi_json_get_number(action->tool_arguments_json, "timeout", &timeout) && timeout > 0) {
-        action->timeout_seconds = timeout;
-      }
-      if (chi_is_blank(action->tool_command)) {
-        free(action->tool_command);
-        action->tool_command = NULL;
-        action->final_text = chi_strdup("tool call missing command");
-        action->is_tool = 0;
-        ok = action->final_text != NULL;
-      } else {
-        action->is_tool = 1;
-        ok = 1;
+      action->data.tool.command = chi_json_get_string(action->data.tool.arguments_json, "command");
+      if (chi_json_get_number(action->data.tool.arguments_json, "timeout", &timeout_seconds) &&
+          timeout_seconds > 0) {
+        action->data.tool.timeout_seconds = timeout_seconds;
       }
     }
+
+    if (!chi_is_blank(action->data.tool.command)) {
+      free(status);
+      free(reason);
+      free(reasoning_summary);
+      free(payload);
+      free(tool_payload);
+      free(output_done_payload);
+      chi_provider_tool_call_reset(&tool_call);
+      return 1;
+    }
+
+    free(action->data.tool.call_id);
+    free(action->data.tool.name);
+    free(action->data.tool.arguments_json);
+    free(action->data.tool.command);
+    memset(&action->data.tool, 0, sizeof(action->data.tool));
+    action->kind = CHI_ACTION_KIND_FINAL;
+    if (tool_call.kind == CHI_TOOL_KIND_CUSTOM) {
+      action->data.final_text = chi_strdup("tool call missing input");
+    } else {
+      action->data.final_text = chi_strdup("tool call missing command");
+    }
+    ok = action->data.final_text != NULL;
 
     free(status);
     free(reason);
@@ -3647,9 +3719,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
     free(payload);
     free(tool_payload);
     free(output_done_payload);
-    free(call_id);
-    free(tool_name);
-    free(tool_call_payload);
+    chi_provider_tool_call_reset(&tool_call);
     return ok;
   }
 
@@ -3674,9 +3744,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
     free(payload);
     free(tool_payload);
     free(output_done_payload);
-    free(call_id);
-    free(tool_name);
-    free(tool_call_payload);
+    chi_provider_tool_call_reset(&tool_call);
     if (*err_out == NULL) {
       *err_out = chi_format("could not parse output text from provider response: %s", response_body);
     }
@@ -3695,9 +3763,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
   free(output_done_payload);
   free(output_text);
   free(reasoning_summary);
-  free(call_id);
-  free(tool_name);
-  free(tool_call_payload);
+  chi_provider_tool_call_reset(&tool_call);
   return ok;
 }
 
@@ -4137,24 +4203,28 @@ static int chi_load_system_prompt_or_report(chi_config *cfg) {
 }
 
 static int chi_ensure_action_tool_call_id(chi_action *action, unsigned long long *call_seq) {
-  if (!action->is_tool || !chi_is_blank(action->tool_call_id)) {
+  if (action->kind != CHI_ACTION_KIND_TOOL || !chi_is_blank(action->data.tool.call_id)) {
     return 1;
   }
 
   (*call_seq)++;
-  action->tool_call_id = chi_format("call_%llu", *call_seq);
-  return action->tool_call_id != NULL;
+  action->data.tool.call_id = chi_format("call_%llu", *call_seq);
+  return action->data.tool.call_id != NULL;
 }
 
 static int chi_append_assistant_action(chi_conversation *convo, const chi_action *action) {
+  if (action->kind == CHI_ACTION_KIND_FINAL) {
+    return chi_conversation_add(convo, "assistant", action->assistant_text, NULL, NULL, NULL, 0);
+  }
+
   return chi_conversation_add(
       convo,
       "assistant",
       action->assistant_text,
-      action->is_tool ? action->tool_call_id : NULL,
-      action->is_tool ? action->tool_name : NULL,
-      action->is_tool ? action->tool_arguments_json : NULL,
-      action->is_tool ? action->tool_is_custom : 0);
+      action->data.tool.call_id,
+      action->data.tool.name,
+      action->data.tool.arguments_json,
+      action->data.tool.kind == CHI_TOOL_KIND_CUSTOM);
 }
 
 static int chi_run_tool_action(
@@ -4164,18 +4234,23 @@ static int chi_run_tool_action(
     int *is_error_out,
     char **tool_error_out,
     const char **runner_error_out) {
-  double timeout = action->timeout_seconds > 0 ? action->timeout_seconds : 0;
-  const char *tool_name = chi_is_blank(action->tool_name) ? "bash" : action->tool_name;
+  const chi_tool_action *tool = &action->data.tool;
+  double timeout = tool->timeout_seconds > 0 ? tool->timeout_seconds : 0;
+  const char *tool_name = tool->name;
 
   *tool_output_out = NULL;
   *is_error_out = 1;
   *tool_error_out = NULL;
   *runner_error_out = NULL;
 
-  if (action->tool_is_custom) {
+  assert(action->kind == CHI_ACTION_KIND_TOOL);
+  assert(!chi_is_blank(tool_name));
+  assert(!chi_is_blank(tool->command));
+
+  if (tool->kind == CHI_TOOL_KIND_CUSTOM) {
     if (strcmp(tool_name, "apply_patch") == 0) {
       if (chi_run_apply_patch_tool(
-              cfg->working_dir, action->tool_command, tool_output_out, is_error_out, tool_error_out)) {
+              cfg->working_dir, tool->command, tool_output_out, is_error_out, tool_error_out)) {
         return 1;
       }
 
@@ -4195,7 +4270,7 @@ static int chi_run_tool_action(
   }
 
   if (strcmp(tool_name, "bash") == 0) {
-    if (chi_run_bash(cfg->working_dir, action->tool_command, timeout, tool_output_out, is_error_out, tool_error_out)) {
+    if (chi_run_bash(cfg->working_dir, tool->command, timeout, tool_output_out, is_error_out, tool_error_out)) {
       return 1;
     }
 
@@ -4247,22 +4322,28 @@ static int chi_handle_tool_action(
   char *tool_output = NULL;
   char *tool_error = NULL;
   char *tool_record = NULL;
-  const char *tool_name = chi_is_blank(action->tool_name) ? "bash" : action->tool_name;
+  const chi_tool_action *tool = &action->data.tool;
+  const char *tool_name = tool->name;
   const char *runner_error = NULL;
   int is_error = 0;
   int ok = 0;
 
-  call_id = chi_strdup(action->tool_call_id);
+  assert(action->kind == CHI_ACTION_KIND_TOOL);
+  assert(!chi_is_blank(tool_name));
+  assert(!chi_is_blank(tool->command));
+  assert(!chi_is_blank(tool->call_id));
+
+  call_id = chi_strdup(tool->call_id);
   if (call_id == NULL) {
     fprintf(stderr, "out of memory preparing tool call id\n");
     goto cleanup;
   }
 
   printf("[tool start] %s (%s)\n", tool_name, call_id);
-  if (action->tool_is_custom) {
-    printf("[tool input]\n%s\n", action->tool_command == NULL ? "" : action->tool_command);
+  if (tool->kind == CHI_TOOL_KIND_CUSTOM) {
+    printf("[tool input]\n%s\n", tool->command);
   } else {
-    printf("[tool command]\n%s\n", action->tool_command == NULL ? "" : action->tool_command);
+    printf("[tool command]\n%s\n", tool->command);
   }
 
   if (!chi_run_tool_action(cfg, action, &tool_output, &is_error, &tool_error, &runner_error)) {
@@ -4276,7 +4357,8 @@ static int chi_handle_tool_action(
   }
 
   if (!chi_build_tool_record(tool_output, tool_error, &tool_record) ||
-      !chi_conversation_add(convo, "toolResult", tool_record, call_id, NULL, NULL, action->tool_is_custom)) {
+      !chi_conversation_add(
+          convo, "toolResult", tool_record, call_id, NULL, NULL, tool->kind == CHI_TOOL_KIND_CUSTOM)) {
     fprintf(stderr, "failed to append tool result\n");
     goto cleanup;
   }
@@ -4542,8 +4624,8 @@ int main(int argc, char **argv) {
         printf("[thinking]\n%s\n", action.reasoning_summary);
       }
 
-      if (!action.is_tool) {
-        printf("[final]\n%s\n", action.final_text == NULL ? "" : action.final_text);
+      if (action.kind == CHI_ACTION_KIND_FINAL) {
+        printf("[final]\n%s\n", action.data.final_text == NULL ? "" : action.data.final_text);
         printf("session: %s\n", cfg.session_id);
         chi_action_reset(&action);
         finalized = 1;
