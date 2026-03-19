@@ -71,12 +71,6 @@ typedef struct {
 } chi_conversation;
 
 typedef struct {
-  char **items;
-  size_t count;
-  size_t cap;
-} chi_prompt_queue;
-
-typedef struct {
   char *output;
   int exit_code;
   int timed_out;
@@ -549,61 +543,6 @@ static int chi_conversation_add(
 
   c->items[c->count++] = m;
   return 1;
-}
-
-static void chi_prompt_queue_destroy(chi_prompt_queue *q) {
-  size_t i;
-  if (q == NULL) {
-    return;
-  }
-  for (i = 0; i < q->count; i++) {
-    free(q->items[i]);
-  }
-  free(q->items);
-  memset(q, 0, sizeof(*q));
-}
-
-static int chi_prompt_queue_insert(chi_prompt_queue *q, const char *prompt, int front) {
-  char *copy;
-  if (q == NULL || chi_is_blank(prompt)) {
-    return 0;
-  }
-  if (!chi_ensure_cap((void **)&q->items, &q->cap, q->count + 1, sizeof(char *))) {
-    return 0;
-  }
-  copy = chi_strdup(prompt);
-  if (copy == NULL) {
-    return 0;
-  }
-  if (front && q->count > 0) {
-    memmove(q->items + 1, q->items, q->count * sizeof(char *));
-    q->items[0] = copy;
-  } else {
-    q->items[q->count] = copy;
-  }
-  q->count++;
-  return 1;
-}
-
-static int chi_prompt_queue_push(chi_prompt_queue *q, const char *prompt) {
-  return chi_prompt_queue_insert(q, prompt, 0);
-}
-
-static int chi_prompt_queue_push_front(chi_prompt_queue *q, const char *prompt) {
-  return chi_prompt_queue_insert(q, prompt, 1);
-}
-
-static char *chi_prompt_queue_pop(chi_prompt_queue *q) {
-  char *first;
-  if (q == NULL || q->count == 0) {
-    return NULL;
-  }
-  first = q->items[0];
-  if (q->count > 1) {
-    memmove(q->items, q->items + 1, (q->count - 1) * sizeof(char *));
-  }
-  q->count--;
-  return first;
 }
 
 static const char *chi_skip_ws(const char *s) {
@@ -4085,7 +4024,7 @@ static int chi_parse_backend(const char *value, chi_backend *out) {
 
 static void chi_usage(const char *argv0) {
   fprintf(stderr,
-          "usage: %s [--backend openai|chatgpt] [--model MODEL] [--reasoning EFFORT] [--system-prompt-file PATH] [--session SESSION_ID] [--queue \"prompt\"] \"prompt\" [working_dir]\n"
+          "usage: %s [--backend openai|chatgpt] [--model MODEL] [--reasoning EFFORT] [--system-prompt-file PATH] [--session SESSION_ID] \"prompt\" [working_dir]\n"
           "example: %s \"Edit hello.py to print hi and run it\" .\n"
           "resume:  %s --session session-abc123 \"continue\" .\n"
           "\n"
@@ -4105,31 +4044,17 @@ static void chi_usage(const char *argv0) {
           argv0);
 }
 
-static int chi_arg_fail(chi_prompt_queue *queue, const char *msg) {
+static int chi_arg_fail(const char *msg) {
   fprintf(stderr, "%s\n", msg);
-  chi_prompt_queue_destroy(queue);
   return 2;
 }
 
-static int chi_arg_usage_fail(chi_prompt_queue *queue, const char *argv0) {
+static int chi_arg_usage_fail(const char *argv0) {
   chi_usage(argv0);
-  chi_prompt_queue_destroy(queue);
   return 2;
 }
 
-static int chi_queue_pop_to_conversation(chi_prompt_queue *queue, chi_conversation *convo) {
-  char *prompt = chi_prompt_queue_pop(queue);
-  int ok;
-  if (prompt == NULL) {
-    return 0;
-  }
-  ok = chi_conversation_add(convo, "user", prompt, NULL, NULL, NULL, 0);
-  free(prompt);
-  return ok;
-}
-
-static void chi_runtime_cleanup(chi_config *cfg, chi_conversation *convo, chi_prompt_queue *queue) {
-  chi_prompt_queue_destroy(queue);
+static void chi_runtime_cleanup(chi_config *cfg, chi_conversation *convo) {
   chi_conversation_destroy(convo);
   free(cfg->system_prompt_text);
   free(cfg->session_path);
@@ -4316,7 +4241,6 @@ static int chi_build_tool_record(const char *tool_output, const char *tool_error
 static int chi_handle_tool_action(
     chi_config *cfg,
     chi_conversation *convo,
-    chi_prompt_queue *queue,
     const chi_action *action) {
   char *call_id = NULL;
   char *tool_output = NULL;
@@ -4363,11 +4287,6 @@ static int chi_handle_tool_action(
     goto cleanup;
   }
 
-  if (queue->count > 0 && !chi_queue_pop_to_conversation(queue, convo)) {
-    fprintf(stderr, "failed to inject queued user message\n");
-    goto cleanup;
-  }
-
   if (!chi_save_session_or_report(cfg, convo)) {
     goto cleanup;
   }
@@ -4385,7 +4304,6 @@ cleanup:
 int main(int argc, char **argv) {
   chi_config cfg;
   chi_conversation convo;
-  chi_prompt_queue queue;
   const char *prompt = NULL;
   const char *working_dir = ".";
   const char *resume_session_id = NULL;
@@ -4401,7 +4319,6 @@ int main(int argc, char **argv) {
 
   memset(&cfg, 0, sizeof(cfg));
   memset(&convo, 0, sizeof(convo));
-  memset(&queue, 0, sizeof(queue));
 
   {
     const char *env_backend = getenv("CHI_BACKEND");
@@ -4432,13 +4349,12 @@ int main(int argc, char **argv) {
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
       chi_usage(argv[0]);
-      chi_prompt_queue_destroy(&queue);
       return 0;
     }
 
     if (strcmp(argv[i], "--backend") == 0) {
       if (i + 1 >= argc || !chi_parse_backend(argv[i + 1], &cfg.backend)) {
-        return chi_arg_fail(&queue, "invalid --backend value");
+        return chi_arg_fail("invalid --backend value");
       }
       backend_explicit = 1;
       i++;
@@ -4447,7 +4363,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--model") == 0) {
       if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
-        return chi_arg_fail(&queue, "missing --model value");
+        return chi_arg_fail("missing --model value");
       }
       cfg.model = argv[++i];
       model_explicit = 1;
@@ -4456,7 +4372,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--reasoning") == 0) {
       if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
-        return chi_arg_fail(&queue, "missing --reasoning value");
+        return chi_arg_fail("missing --reasoning value");
       }
       cfg.reasoning_effort = argv[++i];
       reasoning_explicit = 1;
@@ -4465,7 +4381,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--system-prompt-file") == 0) {
       if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
-        return chi_arg_fail(&queue, "missing --system-prompt-file value");
+        return chi_arg_fail("missing --system-prompt-file value");
       }
       cfg.system_prompt_file = argv[++i];
       system_prompt_explicit = 1;
@@ -4476,7 +4392,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--session") == 0) {
       if (i + 1 >= argc || chi_is_blank(argv[i + 1])) {
-        return chi_arg_fail(&queue, "missing --session value");
+        return chi_arg_fail("missing --session value");
       }
       resume_session_id = argv[++i];
       continue;
@@ -4484,20 +4400,12 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[i], "--max-turns") == 0) {
       if (i + 1 >= argc) {
-        return chi_arg_fail(&queue, "missing --max-turns value");
+        return chi_arg_fail("missing --max-turns value");
       }
       max_turns = atoi(argv[++i]);
       if (max_turns <= 0) {
-        return chi_arg_fail(&queue, "--max-turns must be > 0");
+        return chi_arg_fail("--max-turns must be > 0");
       }
-      continue;
-    }
-
-    if (strcmp(argv[i], "--queue") == 0) {
-      if (i + 1 >= argc || !chi_prompt_queue_push(&queue, argv[i + 1])) {
-        return chi_arg_fail(&queue, "missing or invalid --queue value");
-      }
-      i++;
       continue;
     }
 
@@ -4513,17 +4421,17 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "unexpected argument: %s\n", argv[i]);
-    return chi_arg_usage_fail(&queue, argv[0]);
+    return chi_arg_usage_fail(argv[0]);
   }
 
   if (chi_is_blank(prompt)) {
-    return chi_arg_usage_fail(&queue, argv[0]);
+    return chi_arg_usage_fail(argv[0]);
   }
 
   if (!chi_is_blank(resume_session_id)) {
     if (strlen(resume_session_id) >= sizeof(cfg.session_id)) {
       fprintf(stderr, "session id is too long\n");
-      chi_runtime_cleanup(&cfg, &convo, &queue);
+      chi_runtime_cleanup(&cfg, &convo);
       return 2;
     }
     memcpy(cfg.session_id, resume_session_id, strlen(resume_session_id) + 1);
@@ -4534,7 +4442,7 @@ int main(int argc, char **argv) {
   cfg.session_path = chi_build_session_path(cfg.session_dir, cfg.session_id);
   if (cfg.session_path == NULL) {
     fprintf(stderr, "failed to build session path\n");
-    chi_runtime_cleanup(&cfg, &convo, &queue);
+    chi_runtime_cleanup(&cfg, &convo);
     return 1;
   }
 
@@ -4549,7 +4457,7 @@ int main(int argc, char **argv) {
           reasoning_explicit,
           system_prompt_explicit,
           working_dir_explicit)) {
-    chi_runtime_cleanup(&cfg, &convo, &queue);
+    chi_runtime_cleanup(&cfg, &convo);
     return 1;
   }
 
@@ -4558,13 +4466,7 @@ int main(int argc, char **argv) {
   }
 
   if (!chi_load_system_prompt_or_report(&cfg)) {
-    chi_runtime_cleanup(&cfg, &convo, &queue);
-    return 2;
-  }
-
-  if (!chi_prompt_queue_push_front(&queue, prompt)) {
-    fprintf(stderr, "failed to queue initial prompt\n");
-    chi_runtime_cleanup(&cfg, &convo, &queue);
+    chi_runtime_cleanup(&cfg, &convo);
     return 1;
   }
 
@@ -4572,20 +4474,20 @@ int main(int argc, char **argv) {
     cfg.working_dir = working_dir;
   }
 
-  while (queue.count > 0) {
+  if (!chi_conversation_add(&convo, "user", prompt, NULL, NULL, NULL, 0)) {
+    fprintf(stderr, "failed to append user message\n");
+    exit_code = 1;
+    goto cleanup;
+  }
+
+  if (!chi_save_session_or_report(&cfg, &convo)) {
+    exit_code = 1;
+    goto cleanup;
+  }
+
+  {
     int finalized = 0;
     int turn;
-
-    if (!chi_queue_pop_to_conversation(&queue, &convo)) {
-      fprintf(stderr, "failed to append queued user message\n");
-      exit_code = 1;
-      goto cleanup;
-    }
-
-    if (!chi_save_session_or_report(&cfg, &convo)) {
-      exit_code = 1;
-      goto cleanup;
-    }
 
     for (turn = 0; turn < max_turns; turn++) {
       chi_action action;
@@ -4632,7 +4534,7 @@ int main(int argc, char **argv) {
         break;
       }
 
-      if (!chi_handle_tool_action(&cfg, &convo, &queue, &action)) {
+      if (!chi_handle_tool_action(&cfg, &convo, &action)) {
         chi_action_reset(&action);
         exit_code = 1;
         goto cleanup;
@@ -4649,7 +4551,7 @@ int main(int argc, char **argv) {
   }
 
 cleanup:
-  chi_runtime_cleanup(&cfg, &convo, &queue);
+  chi_runtime_cleanup(&cfg, &convo);
   return exit_code;
 }
 #endif

@@ -2,7 +2,6 @@
 
 `chi` is a compact C coding-agent CLI runtime:
 
-- queued user messages
 - resumable sessions via `--session`
 - tool-call loop (`assistant -> tool -> assistant`)
 - switchable backends (`openai`, `chatgpt`)
@@ -71,15 +70,6 @@ Resume an existing thread by passing the session id back in:
 ```bash
 ./chi --session session-abc123 \
   "Continue and add tests for the change" \
-  .
-```
-
-You can combine that with the existing queueing support:
-
-```bash
-./chi --session session-abc123 \
-  --queue "Then summarize what changed" \
-  "Fix the failing test first" \
   .
 ```
 
