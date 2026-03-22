@@ -3484,7 +3484,7 @@ static int chi_append_request_tools(char **buf, size_t *len, size_t *cap, int ba
            chi_append(buf, len, cap, ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
   }
 
-  /* openai backend: use built-in apply_patch tool type */
+  /* openai backend: built-in apply_patch tool type */
   return chi_append(buf, len, cap, ",\"tools\":[") &&
          chi_append(buf, len, cap, bash_tool_json) &&
          chi_append(buf, len, cap, ",{\"type\":\"apply_patch\"}]") &&
