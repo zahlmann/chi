@@ -52,7 +52,8 @@ typedef enum {
 
 typedef enum {
   CHI_TOOL_KIND_FUNCTION = 0,
-  CHI_TOOL_KIND_CUSTOM = 1
+  CHI_TOOL_KIND_CUSTOM = 1,
+  CHI_TOOL_KIND_APPLY_PATCH = 2
 } chi_tool_kind;
 
 typedef struct {
@@ -531,7 +532,7 @@ static int chi_conversation_add(
   m.tool_call_id = chi_strdup(tool_call_id);
   m.tool_name = chi_strdup(tool_name);
   m.arguments_json = chi_strdup(arguments_json);
-  m.tool_is_custom = tool_is_custom ? 1 : 0;
+  m.tool_is_custom = tool_is_custom;
 
   if (m.role == NULL || m.text == NULL ||
       (tool_call_id != NULL && m.tool_call_id == NULL) ||
@@ -1031,7 +1032,7 @@ static int chi_session_write_message(FILE *fp, const chi_message *m) {
               tool_call_id,
               tool_name,
               arguments_json,
-              m->tool_is_custom ? 1 : 0) < 0) {
+              m->tool_is_custom) < 0) {
     goto done;
   }
 
@@ -1171,7 +1172,7 @@ static int chi_session_add_message_record(
   char *tool_name = chi_json_get_string(line, "tool_name");
   char *arguments_json = chi_json_get_string(line, "arguments_json");
   double tool_is_custom_num = 0;
-  int tool_is_custom = chi_json_get_number(line, "tool_is_custom", &tool_is_custom_num) && tool_is_custom_num > 0;
+  int tool_is_custom = chi_json_get_number(line, "tool_is_custom", &tool_is_custom_num) ? (int)tool_is_custom_num : 0;
   char *tool_call_id_opt = NULL;
   char *tool_name_opt = NULL;
   char *arguments_json_opt = NULL;
@@ -2756,6 +2757,21 @@ static int chi_extract_responses_tool_call(const char *json, chi_provider_tool_c
 
       return 1;
     }
+    if (type != NULL && strcmp(type, "apply_patch_call") == 0) {
+      char *operation = chi_json_get_object(p, "operation");
+      out->kind = CHI_TOOL_KIND_APPLY_PATCH;
+      out->call_id = chi_json_get_string(p, "call_id");
+      out->name = chi_strdup("apply_patch");
+      out->payload = operation;
+      free(type);
+
+      if (out->payload == NULL) {
+        chi_provider_tool_call_reset(out);
+        return 0;
+      }
+
+      return 1;
+    }
     free(type);
     p += 6;
   }
@@ -3295,10 +3311,20 @@ static int chi_append_responses_assistant_message(
       tool_name = "tool";
     }
     if (chi_is_blank(tool_payload)) {
-      tool_payload = m->tool_is_custom ? "" : "{}";
+      tool_payload = m->tool_is_custom == 1 ? "" : "{}";
     }
 
-    if (m->tool_is_custom) {
+    if (m->tool_is_custom == 2) {
+      /* apply_patch_call: operation stored as raw JSON in arguments_json */
+      if (!chi_append_input_item_start(buf, len, cap, first_item) ||
+          !chi_append(buf, len, cap, "{\"type\":\"apply_patch_call\",\"call_id\":") ||
+          !chi_append_json_quoted(buf, len, cap, call_id) ||
+          !chi_append(buf, len, cap, ",\"operation\":") ||
+          !chi_append(buf, len, cap, tool_payload) ||
+          !chi_append(buf, len, cap, "}")) {
+        return 0;
+      }
+    } else if (m->tool_is_custom == 1) {
       if (!chi_append_input_item_start(buf, len, cap, first_item) ||
           !chi_append(buf, len, cap, "{\"type\":\"custom_tool_call\",\"call_id\":") ||
           !chi_append_json_quoted(buf, len, cap, call_id) ||
@@ -3338,7 +3364,16 @@ static int chi_append_responses_tool_result(
   }
   output = chi_is_blank(m->text) ? "(no content)" : m->text;
 
-  if (m->tool_is_custom) {
+  if (m->tool_is_custom == 2) {
+    if (!chi_append_input_item_start(buf, len, cap, first_item) ||
+        !chi_append(buf, len, cap, "{\"type\":\"apply_patch_call_output\",\"call_id\":") ||
+        !chi_append_json_quoted(buf, len, cap, m->tool_call_id) ||
+        !chi_append(buf, len, cap, ",\"output\":") ||
+        !chi_append_json_quoted(buf, len, cap, output) ||
+        !chi_append(buf, len, cap, "}")) {
+      return 0;
+    }
+  } else if (m->tool_is_custom == 1) {
     if (!chi_append_input_item_start(buf, len, cap, first_item) ||
         !chi_append(buf, len, cap, "{\"type\":\"custom_tool_call_output\",\"call_id\":") ||
         !chi_append_json_quoted(buf, len, cap, m->tool_call_id) ||
@@ -3405,7 +3440,7 @@ static int chi_append_responses_input(
   return 1;
 }
 
-static int chi_append_request_tools(char **buf, size_t *len, size_t *cap) {
+static int chi_append_request_tools(char **buf, size_t *len, size_t *cap, int backend) {
   const char *apply_patch_description =
       "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.";
   const char *apply_patch_grammar =
@@ -3438,13 +3473,21 @@ static int chi_append_request_tools(char **buf, size_t *len, size_t *cap) {
       "}"
       "}";
 
+  if (backend == CHI_BACKEND_CHATGPT) {
+    return chi_append(buf, len, cap, ",\"tools\":[") &&
+           chi_append(buf, len, cap, bash_tool_json) &&
+           chi_append(buf, len, cap, ",{\"type\":\"custom\",\"name\":\"apply_patch\",\"description\":") &&
+           chi_append_json_quoted(buf, len, cap, apply_patch_description) &&
+           chi_append(buf, len, cap, ",\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\",\"definition\":") &&
+           chi_append_json_quoted(buf, len, cap, apply_patch_grammar) &&
+           chi_append(buf, len, cap, "}}]") &&
+           chi_append(buf, len, cap, ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
+  }
+
+  /* openai backend: use built-in apply_patch tool type */
   return chi_append(buf, len, cap, ",\"tools\":[") &&
          chi_append(buf, len, cap, bash_tool_json) &&
-         chi_append(buf, len, cap, ",{\"type\":\"custom\",\"name\":\"apply_patch\",\"description\":") &&
-         chi_append_json_quoted(buf, len, cap, apply_patch_description) &&
-         chi_append(buf, len, cap, ",\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\",\"definition\":") &&
-         chi_append_json_quoted(buf, len, cap, apply_patch_grammar) &&
-         chi_append(buf, len, cap, "}}]") &&
+         chi_append(buf, len, cap, ",{\"type\":\"apply_patch\"}]") &&
          chi_append(buf, len, cap, ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
 }
 
@@ -3500,7 +3543,7 @@ static char *chi_build_request_json(const chi_config *cfg, const chi_conversatio
       !chi_append_json_quoted(&json, &len, &cap, cfg->model) ||
       !chi_append(&json, &len, &cap, ",") ||
       !chi_append_responses_input(conversation, input_system_prompt, &json, &len, &cap) ||
-      !chi_append_request_tools(&json, &len, &cap)) {
+      !chi_append_request_tools(&json, &len, &cap, cfg->backend)) {
     free(json);
     *err_out = chi_strdup("out of memory while building provider request");
     return NULL;
@@ -3599,7 +3642,9 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
 
     if (chi_is_blank(action->data.tool.name)) {
       free(action->data.tool.name);
-      if (action->data.tool.kind == CHI_TOOL_KIND_CUSTOM) {
+      if (action->data.tool.kind == CHI_TOOL_KIND_APPLY_PATCH) {
+        action->data.tool.name = chi_strdup("apply_patch");
+      } else if (action->data.tool.kind == CHI_TOOL_KIND_CUSTOM) {
         action->data.tool.name = chi_strdup("tool");
       } else {
         action->data.tool.name = chi_strdup("bash");
@@ -3620,6 +3665,29 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
 
     if (action->data.tool.kind == CHI_TOOL_KIND_CUSTOM) {
       action->data.tool.command = chi_strdup(action->data.tool.arguments_json);
+    } else if (action->data.tool.kind == CHI_TOOL_KIND_APPLY_PATCH) {
+      /* openai responses api: apply_patch_call with operation object */
+      char *op_json = action->data.tool.arguments_json;
+      char *op_type = chi_json_get_string(op_json, "type");
+      char *op_path = chi_json_get_string(op_json, "path");
+      char *op_diff = chi_json_get_string(op_json, "diff");
+
+      if (op_type != NULL && op_path != NULL && strcmp(op_type, "create_file") == 0) {
+        action->data.tool.command = chi_format(
+            "*** Begin Patch\n*** Add File: %s\n%s\n*** End Patch\n",
+            op_path, op_diff != NULL ? op_diff : "");
+      } else if (op_type != NULL && op_path != NULL && strcmp(op_type, "delete_file") == 0) {
+        action->data.tool.command = chi_format(
+            "*** Begin Patch\n*** Delete File: %s\n*** End Patch\n", op_path);
+      } else if (op_type != NULL && op_path != NULL) {
+        action->data.tool.command = chi_format(
+            "*** Begin Patch\n*** Update File: %s\n%s\n*** End Patch\n",
+            op_path, op_diff != NULL ? op_diff : "");
+      }
+
+      free(op_type);
+      free(op_path);
+      free(op_diff);
     } else {
       action->data.tool.command = chi_json_get_string(action->data.tool.arguments_json, "command");
       if (chi_json_get_number(action->data.tool.arguments_json, "timeout", &timeout_seconds) &&
@@ -3645,7 +3713,7 @@ static int chi_extract_provider_action(const char *response_body, chi_action *ac
     free(action->data.tool.command);
     memset(&action->data.tool, 0, sizeof(action->data.tool));
     action->kind = CHI_ACTION_KIND_FINAL;
-    if (tool_call.kind == CHI_TOOL_KIND_CUSTOM) {
+    if (tool_call.kind == CHI_TOOL_KIND_CUSTOM || tool_call.kind == CHI_TOOL_KIND_APPLY_PATCH) {
       action->data.final_text = chi_strdup("tool call missing input");
     } else {
       action->data.final_text = chi_strdup("tool call missing command");
@@ -4149,7 +4217,8 @@ static int chi_append_assistant_action(chi_conversation *convo, const chi_action
       action->data.tool.call_id,
       action->data.tool.name,
       action->data.tool.arguments_json,
-      action->data.tool.kind == CHI_TOOL_KIND_CUSTOM);
+      action->data.tool.kind == CHI_TOOL_KIND_CUSTOM ? 1 :
+      action->data.tool.kind == CHI_TOOL_KIND_APPLY_PATCH ? 2 : 0);
 }
 
 static int chi_run_tool_action(
@@ -4172,17 +4241,17 @@ static int chi_run_tool_action(
   assert(!chi_is_blank(tool_name));
   assert(!chi_is_blank(tool->command));
 
-  if (tool->kind == CHI_TOOL_KIND_CUSTOM) {
-    if (strcmp(tool_name, "apply_patch") == 0) {
-      if (chi_run_apply_patch_tool(
-              cfg->working_dir, tool->command, tool_output_out, is_error_out, tool_error_out)) {
-        return 1;
-      }
-
-      *runner_error_out = "failed to run apply_patch";
-      return 0;
+  if (strcmp(tool_name, "apply_patch") == 0) {
+    if (chi_run_apply_patch_tool(
+            cfg->working_dir, tool->command, tool_output_out, is_error_out, tool_error_out)) {
+      return 1;
     }
 
+    *runner_error_out = "failed to run apply_patch";
+    return 0;
+  }
+
+  if (tool->kind == CHI_TOOL_KIND_CUSTOM) {
     *tool_output_out = chi_strdup("");
     *tool_error_out = chi_format("unsupported custom tool: %s", tool_name);
     *is_error_out = 1;
@@ -4264,7 +4333,7 @@ static int chi_handle_tool_action(
   }
 
   printf("[tool start] %s (%s)\n", tool_name, call_id);
-  if (tool->kind == CHI_TOOL_KIND_CUSTOM) {
+  if (tool->kind == CHI_TOOL_KIND_CUSTOM || tool->kind == CHI_TOOL_KIND_APPLY_PATCH) {
     printf("[tool input]\n%s\n", tool->command);
   } else {
     printf("[tool command]\n%s\n", tool->command);
@@ -4282,7 +4351,9 @@ static int chi_handle_tool_action(
 
   if (!chi_build_tool_record(tool_output, tool_error, &tool_record) ||
       !chi_conversation_add(
-          convo, "toolResult", tool_record, call_id, NULL, NULL, tool->kind == CHI_TOOL_KIND_CUSTOM)) {
+          convo, "toolResult", tool_record, call_id, NULL, NULL,
+          tool->kind == CHI_TOOL_KIND_CUSTOM ? 1 :
+          tool->kind == CHI_TOOL_KIND_APPLY_PATCH ? 2 : 0)) {
     fprintf(stderr, "failed to append tool result\n");
     goto cleanup;
   }
