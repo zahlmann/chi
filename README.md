@@ -47,7 +47,7 @@ cc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L \
 
 ```bash
 ./chi \
-  --model gpt-5.4 \
+  --model gpt-5.5 \
   "Use bash to create hello.py and run it with uv run hello.py" \
   .
 ```
@@ -79,8 +79,8 @@ Resume an existing thread by passing the session id back in:
 - if no usable ChatGPT credentials are found and `chi` has a terminal, it prints `https://auth.openai.com/codex/device`, shows a one-time sign-in code, waits for approval, and then saves `access_token`, `refresh_token`, `account_id`, and expiry in `~/.chi/auth.json`
 - `openai` backend: set `OPENAI_API_KEY` and pass `--backend openai` or `CHI_BACKEND=openai`
 - optional network tuning:
-  - `CHI_MODEL` (same as passing `--model`, default `gpt-5.4`)
-  - `CHI_REASONING_EFFORT` (same as passing `--reasoning`, default `high`)
+  - `CHI_MODEL` (same as passing `--model`, default `gpt-5.5`)
+  - `CHI_REASONING_EFFORT` (same as passing `--reasoning`, default `medium`)
   - `CHI_SESSION_DIR` (session state dir, default `.chi-sessions`)
   - `CHI_SYSTEM_PROMPT_FILE` (custom system prompt text file)
   - `CHI_HTTP_CONNECT_TIMEOUT` (default `5`)
